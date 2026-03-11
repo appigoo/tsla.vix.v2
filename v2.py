@@ -316,78 +316,188 @@ def tg_test(bot_token: str, chat_id: str) -> tuple[bool, str]:
                    "✅ <b>TSLA × VIX 监控系统</b>\n\n连接测试成功！告警通知已就绪。")
 
 
-def detect_divergence(
+def calc_trend(series: pd.Series) -> tuple[float, float, float]:
+    """线性回归趋势：返回 (斜率_%/分钟, R², 总变化%)"""
+    if len(series) < 3:
+        return 0.0, 0.0, 0.0
+    y = series.values.astype(float)
+    x = np.arange(len(y))
+    slope, intercept, r, *_ = stats.linregress(x, y)
+    mean_val = float(np.mean(y))
+    slope_pct = (slope / mean_val * 100) if mean_val != 0 else 0.0
+    total_chg = (y[-1] - y[0]) / y[0] * 100 if y[0] != 0 else 0.0
+    return slope_pct, r**2, total_chg
+
+
+def detect_spot(
     df: pd.DataFrame,
-    window: int = 5,
+    spot_window: int = 5,
     vix_thresh: float = 1.0,
     tsla_thresh: float = 0.5,
 ) -> dict | None:
     """
-    检测 VIX 与 TSLA 的背离信号。
-    使用最近 window 根 K 线的涨跌幅。
-
-    背离类型：
-    - 「恐慌背离」：VIX 显著上升，但 TSLA 未跟随下跌（异常强势）
-    - 「情绪背离」：VIX 显著下降，但 TSLA 未跟随上涨（异常弱势）
-
-    返回 None（无背离）或 dict（背离详情）。
+    ① 单点变化检测（快速预警）
+    逻辑：比较最近 spot_window 根 K 线的首尾变化幅度
+    优点：反应快，适合捕捉急速脉冲
+    缺点：容易被噪音误触发
     """
-    if len(df) < window + 1:
+    if len(df) < spot_window + 1:
         return None
 
-    recent = df.iloc[-window:]
-    base   = df.iloc[-(window + 1)]
+    base = df.iloc[-(spot_window + 1)]
+    last = df.iloc[-1]
+    now_ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
 
-    vix_chg_pct  = (float(recent["VIX"].iloc[-1])  - float(base["VIX"]))  / float(base["VIX"])  * 100
-    tsla_chg_pct = (float(recent["TSLA"].iloc[-1]) - float(base["TSLA"])) / float(base["TSLA"]) * 100
+    vix_chg  = (float(last["VIX"])  - float(base["VIX"]))  / float(base["VIX"])  * 100
+    tsla_chg = (float(last["TSLA"]) - float(base["TSLA"])) / float(base["TSLA"]) * 100
 
-    # 恐慌背离：VIX↑ 但 TSLA 未跌（TSLA 反而持平或涨）
-    if vix_chg_pct >= vix_thresh and tsla_chg_pct >= -tsla_thresh:
+    # VIX 急升，TSLA 未跌
+    if vix_chg >= vix_thresh and tsla_chg >= -tsla_thresh:
         return {
-            "type":     "panic_divergence",
-            "label":    "🟠 恐慌背离",
-            "badge":    "divup",
-            "css":      "div-up",
-            "emoji":    "🟠",
-            "vix_chg":  vix_chg_pct,
-            "tsla_chg": tsla_chg_pct,
+            "type":    "spot_vix_up",
+            "mode":    "spot",
+            "label":   "🟠 快速预警：VIX急升 TSLA未跌",
+            "badge":   "divup",
+            "css":     "div-up",
+            "emoji":   "🟠",
+            "action":  "⚠️ TSLA 或将补跌（考虑减仓/做空）",
             "msg": (
-                f"⚠️ <b>恐慌背离警报</b>\n\n"
-                f"📈 VIX 在过去 {window} 分钟内上涨 <b>{vix_chg_pct:+.2f}%</b>（恐慌加剧），\n"
-                f"但 TSLA 未出现预期跌幅，反而变动 <b>{tsla_chg_pct:+.2f}%</b>。\n\n"
-                f"📌 <b>意义</b>：TSLA 出现异常强势，可能有正面催化剂（利好消息、机构托盘）支撑，\n"
-                f"或市场尚未充分定价恐慌情绪。\n\n"
-                f"💡 关注 TSLA 是否后续补跌，或 VIX 是否快速回落。\n\n"
-                f"🕐 时间：{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S ET')}"
+                f"🟠 <b>[快速预警] VIX 急升，TSLA 尚未跟跌</b>\n\n"
+                f"📈 VIX 过去 {spot_window} 分钟变化：<b>{vix_chg:+.2f}%</b>（当前 {float(last['VIX']):.2f}）\n"
+                f"😴 TSLA 同期变化：<b>{tsla_chg:+.2f}%</b>（当前 ${float(last['TSLA']):.2f}）\n\n"
+                f"📌 恐慌情绪急速上升，TSLA 尚未定价，大概率即将补跌。\n"
+                f"💡 考虑减仓或设置止损，观察接下来 3–5 分钟。\n\n"
+                f"🕐 {now_ts}"
             ),
             "desc_html": (
-                f"VIX <b>{vix_chg_pct:+.2f}%</b>↑，"
-                f"但 TSLA 仅 <b>{tsla_chg_pct:+.2f}%</b>（应跌未跌）"
+                f"<b style='color:#ff8c00'>[单点]</b> "
+                f"VIX <b>{vix_chg:+.2f}%</b>（{spot_window}分钟），"
+                f"TSLA 仅 <b>{tsla_chg:+.2f}%</b>（未跌）<br>"
+                f"<span style='color:#ff8c00'>⚠ TSLA 或将补跌 · 减仓/做空参考</span>"
             ),
         }
 
-    # 情绪背离：VIX↓ 但 TSLA 未涨（TSLA 反而持平或跌）
-    if vix_chg_pct <= -vix_thresh and tsla_chg_pct <= tsla_thresh:
+    # VIX 急跌，TSLA 未涨
+    if vix_chg <= -vix_thresh and tsla_chg <= tsla_thresh:
         return {
-            "type":     "calm_divergence",
-            "label":    "🔵 情绪背离",
-            "badge":    "divdn",
-            "css":      "div-down",
-            "emoji":    "🔵",
-            "vix_chg":  vix_chg_pct,
-            "tsla_chg": tsla_chg_pct,
+            "type":    "spot_vix_down",
+            "mode":    "spot",
+            "label":   "🔵 快速预警：VIX急跌 TSLA未涨",
+            "badge":   "divdn",
+            "css":     "div-down",
+            "emoji":   "🔵",
+            "action":  "✅ TSLA 或将补涨（考虑做多/加仓）",
             "msg": (
-                f"⚠️ <b>情绪背离警报</b>\n\n"
-                f"📉 VIX 在过去 {window} 分钟内下跌 <b>{vix_chg_pct:+.2f}%</b>（恐慌缓解），\n"
-                f"但 TSLA 未出现预期涨幅，反而变动 <b>{tsla_chg_pct:+.2f}%</b>。\n\n"
-                f"📌 <b>意义</b>：TSLA 出现异常弱势，可能有负面催化剂（利空消息、卖盘压力）\n"
-                f"压制其跟随市场反弹。\n\n"
-                f"💡 关注 TSLA 是否持续承压，或市场情绪是否真的改善。\n\n"
-                f"🕐 时间：{datetime.now(ET).strftime('%Y-%m-%d %H:%M:%S ET')}"
+                f"🔵 <b>[快速预警] VIX 急跌，TSLA 尚未跟涨</b>\n\n"
+                f"📉 VIX 过去 {spot_window} 分钟变化：<b>{vix_chg:+.2f}%</b>（当前 {float(last['VIX']):.2f}）\n"
+                f"😴 TSLA 同期变化：<b>{tsla_chg:+.2f}%</b>（当前 ${float(last['TSLA']):.2f}）\n\n"
+                f"📌 恐慌情绪迅速消退，TSLA 尚未定价，大概率即将补涨。\n"
+                f"💡 考虑做多或加仓，观察接下来 3–5 分钟上行动能。\n\n"
+                f"🕐 {now_ts}"
             ),
             "desc_html": (
-                f"VIX <b>{vix_chg_pct:+.2f}%</b>↓，"
-                f"但 TSLA 仅 <b>{tsla_chg_pct:+.2f}%</b>（应涨未涨）"
+                f"<b style='color:#7b7bff'>[单点]</b> "
+                f"VIX <b>{vix_chg:+.2f}%</b>（{spot_window}分钟），"
+                f"TSLA 仅 <b>{tsla_chg:+.2f}%</b>（未涨）<br>"
+                f"<span style='color:#3df5b0'>✅ TSLA 或将补涨 · 做多/加仓参考</span>"
+            ),
+        }
+
+    return None
+
+
+def detect_trend(
+    df: pd.DataFrame,
+    trend_window: int = 10,
+    vix_slope_thresh: float = 0.05,
+    tsla_slope_thresh: float = 0.02,
+    min_r2: float = 0.5,
+) -> dict | None:
+    """
+    ② 线性回归趋势检测（高置信度确认）
+    逻辑：对最近 trend_window 根 K 线做线性回归，检测持续方向性趋势
+    优点：过滤锯齿噪音，只响应真正的趋势性移动（R² 门槛）
+    缺点：反应稍慢，需要趋势持续一段时间才触发
+    """
+    if len(df) < trend_window + 2:
+        return None
+
+    recent = df.iloc[-trend_window:].copy()
+    vix_slope,  vix_r2,  vix_total  = calc_trend(recent["VIX"])
+    tsla_slope, tsla_r2, tsla_total = calc_trend(recent["TSLA"])
+
+    now_ts   = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+    vix_now  = float(recent["VIX"].iloc[-1])
+    tsla_now = float(recent["TSLA"].iloc[-1])
+    strength = "强" if vix_r2 >= 0.75 else "中等"
+
+    # VIX 持续上升趋势，TSLA 未跟跌
+    if (vix_slope  >=  vix_slope_thresh and
+        vix_r2     >=  min_r2           and
+        tsla_slope >= -tsla_slope_thresh):
+        return {
+            "type":       "trend_vix_up",
+            "mode":       "trend",
+            "label":      "🔴 趋势确认：VIX持续升 TSLA未跌",
+            "badge":      "divup",
+            "css":        "div-up",
+            "emoji":      "🔴",
+            "vix_slope":  vix_slope,
+            "tsla_slope": tsla_slope,
+            "vix_r2":     vix_r2,
+            "action":     "⚠️ 趋势确认：TSLA 补跌概率高（减仓/做空）",
+            "msg": (
+                f"🔴 <b>[趋势确认] VIX 持续上升，TSLA 尚未跟跌</b>\n\n"
+                f"📈 VIX 趋势（过去 {trend_window} 分钟）\n"
+                f"   斜率：{vix_slope:+.3f}%/分钟  |  R²={vix_r2:.2f}（{strength}趋势）\n"
+                f"   累计涨幅：{vix_total:+.2f}%  |  当前：{vix_now:.2f}\n\n"
+                f"😴 TSLA 同期走势\n"
+                f"   斜率：{tsla_slope:+.3f}%/分钟  |  当前：${tsla_now:.2f}\n\n"
+                f"📌 持续性恐慌趋势已形成（R²={vix_r2:.2f}），置信度高。\n"
+                f"   TSLA 补跌概率显著，非短期脉冲。\n\n"
+                f"💡 建议减仓或做空，并设置止损位。\n\n"
+                f"🕐 {now_ts}"
+            ),
+            "desc_html": (
+                f"<b style='color:#ff3d6b'>[趋势]</b> "
+                f"VIX 斜率 <b>{vix_slope:+.3f}%/分钟</b>（R²={vix_r2:.2f}，{strength}），"
+                f"TSLA 斜率仅 <b>{tsla_slope:+.3f}%/分钟</b><br>"
+                f"<span style='color:#ff8c00'>⚠ 趋势确认 · TSLA 补跌概率高 · 减仓/做空</span>"
+            ),
+        }
+
+    # VIX 持续下降趋势，TSLA 未跟涨
+    if (vix_slope  <= -vix_slope_thresh and
+        vix_r2     >=  min_r2           and
+        tsla_slope <=  tsla_slope_thresh):
+        return {
+            "type":       "trend_vix_down",
+            "mode":       "trend",
+            "label":      "🟢 趋势确认：VIX持续降 TSLA未涨",
+            "badge":      "divdn",
+            "css":        "div-down",
+            "emoji":      "🟢",
+            "vix_slope":  vix_slope,
+            "tsla_slope": tsla_slope,
+            "vix_r2":     vix_r2,
+            "action":     "✅ 趋势确认：TSLA 补涨概率高（做多/加仓）",
+            "msg": (
+                f"🟢 <b>[趋势确认] VIX 持续下降，TSLA 尚未跟涨</b>\n\n"
+                f"📉 VIX 趋势（过去 {trend_window} 分钟）\n"
+                f"   斜率：{vix_slope:+.3f}%/分钟  |  R²={vix_r2:.2f}（{strength}趋势）\n"
+                f"   累计跌幅：{vix_total:+.2f}%  |  当前：{vix_now:.2f}\n\n"
+                f"😴 TSLA 同期走势\n"
+                f"   斜率：{tsla_slope:+.3f}%/分钟  |  当前：${tsla_now:.2f}\n\n"
+                f"📌 持续性恐慌消退趋势已形成（R²={vix_r2:.2f}），置信度高。\n"
+                f"   TSLA 补涨概率显著，非短期脉冲反弹。\n\n"
+                f"💡 建议做多或加仓，关注上行动能确认。\n\n"
+                f"🕐 {now_ts}"
+            ),
+            "desc_html": (
+                f"<b style='color:#3df5b0'>[趋势]</b> "
+                f"VIX 斜率 <b>{vix_slope:+.3f}%/分钟</b>（R²={vix_r2:.2f}，{strength}），"
+                f"TSLA 斜率仅 <b>{tsla_slope:+.3f}%/分钟</b><br>"
+                f"<span style='color:#3df5b0'>✅ 趋势确认 · TSLA 补涨概率高 · 做多/加仓</span>"
             ),
         }
 
@@ -453,14 +563,25 @@ with st.sidebar:
                                    placeholder="-1001234567890 或 你的 user_id",
                                    help="可用 @userinfobot 查询")
 
-    # 背离检测参数
-    st.markdown("**背离检测灵敏度**")
-    div_window     = st.slider("观察窗口（分钟数）", 1, 30, 5,
-                               help="用最近 N 根 1 分钟 K 线计算涨跌幅")
-    vix_div_thresh = st.slider("VIX 变动阈值（%）", 0.5, 5.0, 1.0, step=0.1,
-                               help="VIX 变动超过此值才触发检测")
-    tsla_div_thresh= st.slider("TSLA 容忍阈值（%）", 0.2, 3.0, 0.5, step=0.1,
-                               help="TSLA 变动在此范围内视为「未跟随」")
+    # ── 单点变化检测参数
+    st.markdown("**① 单点变化（快速预警）**")
+    spot_window      = st.slider("单点观察窗口（分钟）", 2, 15, 5,
+                                 help="比较最近 N 分钟首尾变化幅度，反应快但易受噪音影响")
+    vix_thresh       = st.slider("VIX 单点变化阈值（%）", 0.3, 5.0, 1.0, step=0.1,
+                                 help="VIX 变动超过此值即触发检测")
+    tsla_thresh      = st.slider("TSLA 未响应容忍度（%）", 0.1, 3.0, 0.5, step=0.1,
+                                 help="TSLA 变动在此范围内视为「未跟随」")
+
+    # ── 趋势回归检测参数
+    st.markdown("**② 线性趋势（高置信确认）**")
+    trend_window      = st.slider("趋势观察窗口（分钟）", 5, 30, 10,
+                                  help="对最近 N 分钟做线性回归，过滤噪音，只响应持续趋势")
+    vix_slope_thresh  = st.slider("VIX 趋势斜率阈值（%/分钟）", 0.01, 0.20, 0.05, step=0.01,
+                                  help="VIX 每分钟需涨/跌超过此值才视为有效趋势")
+    tsla_slope_thresh = st.slider("TSLA 斜率容忍度（%/分钟）", 0.01, 0.10, 0.02, step=0.01,
+                                  help="TSLA 每分钟变化低于此值视为「未跟随」")
+    min_r2            = st.slider("VIX 趋势线性度 R²", 0.3, 0.9, 0.5, step=0.05,
+                                  help="R² 越高代表趋势越稳定，建议 0.5 以上过滤锯齿")
 
     # 冷却时间（防止重复告警）
     alert_cooldown = st.slider("告警冷却时间（分钟）", 1, 60, 15,
@@ -538,52 +659,48 @@ if "last_alert_time" not in st.session_state:
     st.session_state.last_alert_time = {}  # {type_str: datetime}
 
 # ══════════════════════════════════════════════════════════
-# 背离检测 & Telegram 告警
+# 双引擎背离检测 & Telegram 告警
 # ══════════════════════════════════════════════════════════
-divergence = detect_divergence(
-    df1m,
-    window=div_window,
-    vix_thresh=vix_div_thresh,
-    tsla_thresh=tsla_div_thresh,
-)
+sig_spot  = detect_spot(df1m, spot_window, vix_thresh, tsla_thresh)
+sig_trend = detect_trend(df1m, trend_window, vix_slope_thresh, tsla_slope_thresh, min_r2)
 
-tg_alert_fired = False
-tg_alert_status = None
+# 合并为列表，各自独立触发（类型名不同，冷却时间互不干扰）
+all_signals = [s for s in [sig_spot, sig_trend] if s is not None]
 
-if divergence is not None:
-    dtype = divergence["type"]
-    now_dt = datetime.now(ET)
+tg_results = {}   # {type: (ok, err)}
+now_dt = datetime.now(ET)
 
-    # 冷却检查
+for sig in all_signals:
+    dtype = sig["type"]
+
+    # 写入历史（去重：同类型 60 秒内不重复写）
+    already = (
+        st.session_state.alert_history and
+        st.session_state.alert_history[0]["type"] == dtype and
+        (now_dt - st.session_state.alert_history[0]["time"]).total_seconds() < 60
+    )
+    if not already:
+        st.session_state.alert_history.insert(0, {
+            "type":      dtype,
+            "mode":      sig["mode"],
+            "label":     sig["label"],
+            "badge":     sig["badge"],
+            "css":       sig["css"],
+            "desc_html": sig["desc_html"],
+            "time":      now_dt,
+            "sent":      False,
+        })
+        st.session_state.alert_history = st.session_state.alert_history[:50]
+
+    # Telegram：各自独立冷却
     last_t = st.session_state.last_alert_time.get(dtype)
     cooldown_ok = (
         last_t is None or
         (now_dt - last_t).total_seconds() >= alert_cooldown * 60
     )
-
-    # 写入告警历史（不受冷却限制，UI 始终展示）
-    already_in_history = (
-        st.session_state.alert_history and
-        st.session_state.alert_history[0]["type"] == dtype and
-        (now_dt - st.session_state.alert_history[0]["time"]).total_seconds() < 60
-    )
-    if not already_in_history:
-        st.session_state.alert_history.insert(0, {
-            "type":      dtype,
-            "label":     divergence["label"],
-            "badge":     divergence["badge"],
-            "css":       divergence["css"],
-            "desc_html": divergence["desc_html"],
-            "time":      now_dt,
-            "sent":      False,
-        })
-        st.session_state.alert_history = st.session_state.alert_history[:30]  # 最多保留30条
-
-    # 发送 Telegram
     if tg_enabled and tg_token and tg_chat_id and cooldown_ok:
-        ok, err = tg_send(tg_token, tg_chat_id, divergence["msg"])
-        tg_alert_fired = ok
-        tg_alert_status = (ok, err)
+        ok, err = tg_send(tg_token, tg_chat_id, sig["msg"])
+        tg_results[dtype] = (ok, err)
         if ok:
             st.session_state.last_alert_time[dtype] = now_dt
             if st.session_state.alert_history:
@@ -699,98 +816,152 @@ if r1m is not None:
 # ══════════════════════════════════════════════════════════
 # 告警状态栏 & 历史记录
 # ══════════════════════════════════════════════════════════
-st.markdown('<div class="sec">🚨 背离告警监控</div>', unsafe_allow_html=True)
+st.markdown('<div class="sec">🚨 双引擎预警监控（单点快速 + 趋势确认）</div>', unsafe_allow_html=True)
 
-alert_col1, alert_col2 = st.columns([3, 2])
+# 实时趋势数值（用于正常状态显示）
+_r_spot  = df1m.iloc[-spot_window:] if len(df1m) >= spot_window else df1m
+_r_trend = df1m.iloc[-trend_window:] if len(df1m) >= trend_window else df1m
+_vix_slope,  _vix_r2,  _ = calc_trend(_r_trend["VIX"])
+_tsla_slope, _tsla_r2, _ = calc_trend(_r_trend["TSLA"])
 
-with alert_col1:
-    # 当前背离状态
-    if divergence is not None:
-        dtype = divergence["type"]
-        last_t = st.session_state.last_alert_time.get(dtype)
-        if last_t:
-            mins_ago = int((datetime.now(ET) - last_t).total_seconds() / 60)
-            sent_str = f"✅ Telegram 已发送（{mins_ago} 分钟前）" if tg_enabled else "📵 Telegram 未启用"
-        else:
-            sent_str = "🆕 首次触发"
+# 单点窗口涨跌幅
+if len(df1m) >= spot_window + 1:
+    _base = df1m.iloc[-(spot_window + 1)]
+    _last = df1m.iloc[-1]
+    _vix_spot_chg  = (float(_last["VIX"])  - float(_base["VIX"]))  / float(_base["VIX"])  * 100
+    _tsla_spot_chg = (float(_last["TSLA"]) - float(_base["TSLA"])) / float(_base["TSLA"]) * 100
+else:
+    _vix_spot_chg = _tsla_spot_chg = 0.0
 
+panel_spot, panel_trend = st.columns(2)
+
+# ── 左：单点预警面板 ──────────────────────────────────────
+with panel_spot:
+    st.markdown(f"""
+    <div style="font-family:'Space Mono',monospace;font-size:9px;letter-spacing:2px;
+                color:#5a5c78;margin-bottom:8px">🟠 单点变化检测（窗口 {spot_window} 分钟）</div>
+    """, unsafe_allow_html=True)
+
+    if sig_spot is not None:
+        tg_s = tg_results.get(sig_spot["type"])
+        tg_icon = ("📲 已推送" if tg_s and tg_s[0] else
+                   f"❌ {tg_s[1]}" if tg_s else
+                   ("📡 监控中" if tg_enabled else "📵 未启用"))
+        action_clr = "#3df5b0" if "down" in sig_spot["type"] else "#ff8c00"
         st.markdown(f"""
-        <div class="alert-box {divergence['css']}">
-          <div class="alert-badge {divergence['badge']}">{divergence['emoji']} {divergence['label']}</div>
-          <div class="alert-msg">{divergence['desc_html']}</div>
-          <div class="alert-time" style="margin-top:6px">{sent_str} · {datetime.now(ET).strftime('%H:%M:%S ET')}</div>
+        <div class="alert-box {sig_spot['css']}">
+          <div class="alert-badge {sig_spot['badge']}">{sig_spot['emoji']} {sig_spot['label'].split('：')[1] if '：' in sig_spot['label'] else sig_spot['label']}</div>
+          <div class="alert-msg" style="margin:6px 0 8px;font-size:12px">{sig_spot['desc_html']}</div>
+          <div style="background:rgba(0,0,0,.3);border-radius:5px;padding:5px 8px;
+                      font-size:12px;color:{action_clr};font-weight:700">{sig_spot['action']}</div>
+          <div class="alert-time" style="margin-top:6px">{tg_icon} · {now_dt.strftime('%H:%M:%S ET')}</div>
         </div>""", unsafe_allow_html=True)
-
-        if tg_alert_status:
-            ok, err = tg_alert_status
-            if ok:
-                st.markdown('<div class="tg-status ok">📲 Telegram 告警已推送</div>', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div class="tg-status err">❌ 推送失败：{err}</div>', unsafe_allow_html=True)
     else:
-        # 计算当前窗口涨跌幅展示
-        if len(df1m) >= div_window + 1:
-            base   = df1m.iloc[-(div_window + 1)]
-            recent_last = df1m.iloc[-1]
-            cur_vix_chg  = (float(recent_last["VIX"])  - float(base["VIX"]))  / float(base["VIX"])  * 100
-            cur_tsla_chg = (float(recent_last["TSLA"]) - float(base["TSLA"])) / float(base["TSLA"]) * 100
-            vix_arrow  = "▲" if cur_vix_chg  >= 0 else "▼"
-            tsla_arrow = "▲" if cur_tsla_chg >= 0 else "▼"
-            summary = (
-                f"过去 {div_window} 分钟：VIX {vix_arrow} {abs(cur_vix_chg):.2f}%，"
-                f"TSLA {tsla_arrow} {abs(cur_tsla_chg):.2f}%  ── 走势符合负相关预期，无背离"
-            )
-        else:
-            summary = "数据积累中，请稍候…"
-
+        vc = "#ff3d6b" if _vix_spot_chg > 0 else "#3df5b0"
+        tc = "#3df5b0" if _tsla_spot_chg > 0 else "#ff3d6b"
+        va = "▲" if _vix_spot_chg > 0 else "▼"
+        ta = "▲" if _tsla_spot_chg > 0 else "▼"
         st.markdown(f"""
-        <div class="kcard t" style="border-left:4px solid #3df5b0">
-          <div class="klabel">当前背离状态</div>
-          <div class="kval t" style="font-size:20px">✅ 正常</div>
-          <div class="ksub">{summary}</div>
+        <div class="kcard t" style="border-left:3px solid #3df5b0;padding:14px 16px">
+          <div class="klabel">单点状态 · 过去 {spot_window} 分钟</div>
+          <div style="font-size:16px;font-weight:700;color:#3df5b0;margin:4px 0">✅ 未触发</div>
+          <div style="font-family:'Space Mono',monospace;font-size:11px;margin-top:6px;line-height:2">
+            <span style="color:{vc}">VIX {va} {abs(_vix_spot_chg):.2f}%</span>
+            &nbsp;·&nbsp;
+            <span style="color:{tc}">TSLA {ta} {abs(_tsla_spot_chg):.2f}%</span>
+          </div>
+          <div style="font-family:'Space Mono',monospace;font-size:10px;color:#5a5c78;margin-top:2px">
+            阈值：VIX±{vix_thresh:.1f}%，TSLA±{tsla_thresh:.1f}%
+          </div>
         </div>""", unsafe_allow_html=True)
 
-    # Telegram 连接状态
+# ── 右：趋势确认面板 ──────────────────────────────────────
+with panel_trend:
+    st.markdown(f"""
+    <div style="font-family:'Space Mono',monospace;font-size:9px;letter-spacing:2px;
+                color:#5a5c78;margin-bottom:8px">🔴🟢 线性趋势检测（窗口 {trend_window} 分钟）</div>
+    """, unsafe_allow_html=True)
+
+    if sig_trend is not None:
+        tg_t = tg_results.get(sig_trend["type"])
+        tg_icon2 = ("📲 已推送" if tg_t and tg_t[0] else
+                    f"❌ {tg_t[1]}" if tg_t else
+                    ("📡 监控中" if tg_enabled else "📵 未启用"))
+        action_clr2 = "#3df5b0" if "down" in sig_trend["type"] else "#ff8c00"
+        st.markdown(f"""
+        <div class="alert-box {sig_trend['css']}">
+          <div class="alert-badge {sig_trend['badge']}">{sig_trend['emoji']} {sig_trend['label'].split('：')[1] if '：' in sig_trend['label'] else sig_trend['label']}</div>
+          <div class="alert-msg" style="margin:6px 0 8px;font-size:12px">{sig_trend['desc_html']}</div>
+          <div style="background:rgba(0,0,0,.3);border-radius:5px;padding:5px 8px;
+                      font-size:12px;color:{action_clr2};font-weight:700">{sig_trend['action']}</div>
+          <div class="alert-time" style="margin-top:6px">{tg_icon2} · {now_dt.strftime('%H:%M:%S ET')}</div>
+        </div>""", unsafe_allow_html=True)
+    else:
+        vc2 = "#ff3d6b" if _vix_slope > 0 else "#3df5b0"
+        tc2 = "#3df5b0" if _tsla_slope > 0 else "#ff3d6b"
+        va2 = "↗" if _vix_slope > 0.01 else ("↘" if _vix_slope < -0.01 else "→")
+        ta2 = "↗" if _tsla_slope > 0.01 else ("↘" if _tsla_slope < -0.01 else "→")
+        st.markdown(f"""
+        <div class="kcard t" style="border-left:3px solid #7b7bff;padding:14px 16px">
+          <div class="klabel">趋势状态 · 过去 {trend_window} 分钟</div>
+          <div style="font-size:16px;font-weight:700;color:#3df5b0;margin:4px 0">✅ 未触发</div>
+          <div style="font-family:'Space Mono',monospace;font-size:11px;margin-top:6px;line-height:2">
+            <span style="color:{vc2}">VIX {va2} {_vix_slope:+.3f}%/分钟</span>
+            &nbsp;·&nbsp;
+            <span style="color:{tc2}">TSLA {ta2} {_tsla_slope:+.3f}%/分钟</span><br>
+            <span style="color:#5a5c78">VIX R²={_vix_r2:.2f}（趋势线性度）</span>
+          </div>
+          <div style="font-family:'Space Mono',monospace;font-size:10px;color:#5a5c78;margin-top:2px">
+            阈值：斜率±{vix_slope_thresh:.2f}%/分钟，R²≥{min_r2:.2f}
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+# ── Telegram 总状态 + 告警说明
+tg_col, info_col = st.columns([1, 2])
+with tg_col:
     if tg_enabled:
         if tg_token and tg_chat_id:
-            st.markdown('<div class="tg-status ok" style="margin-top:6px">📡 Telegram 已配置 · 监控中</div>',
+            st.markdown('<div class="tg-status ok" style="margin-top:4px">📡 Telegram 双引擎监控中</div>',
                         unsafe_allow_html=True)
         else:
-            st.markdown('<div class="tg-status err" style="margin-top:6px">⚠ 已启用但缺少 Token 或 Chat ID</div>',
+            st.markdown('<div class="tg-status err" style="margin-top:4px">⚠ 缺少 Token / Chat ID</div>',
                         unsafe_allow_html=True)
     else:
-        st.markdown('<div class="tg-status off" style="margin-top:6px">📵 Telegram 告警已关闭</div>',
+        st.markdown('<div class="tg-status off" style="margin-top:4px">📵 Telegram 已关闭</div>',
                     unsafe_allow_html=True)
 
-with alert_col2:
+with info_col:
     st.markdown(f"""
-    <div style="font-size:11px;color:#5a5c78;font-family:'Space Mono',monospace;
-                background:#0e0f1a;border:1px solid #1e1f35;border-radius:10px;
-                padding:14px 16px;line-height:2">
-      <b style="color:#dde1f5">告警触发条件</b><br>
-      🟠 <b style="color:#ff8c00">恐慌背离</b><br>
-      VIX ≥ +{vix_div_thresh:.1f}%<br>
-      且 TSLA 变动 ≥ −{tsla_div_thresh:.1f}%（未跌）<br><br>
-      🔵 <b style="color:#7b7bff">情绪背离</b><br>
-      VIX ≤ −{vix_div_thresh:.1f}%<br>
-      且 TSLA 变动 ≤ +{tsla_div_thresh:.1f}%（未涨）<br><br>
-      ⏱ 观察窗口：{div_window} 分钟<br>
-      🔕 冷却时间：{alert_cooldown} 分钟
+    <div style="font-size:10px;color:#5a5c78;font-family:'Space Mono',monospace;
+                line-height:1.8;padding:6px 0">
+      🟠 <b style="color:#dde1f5">单点</b>：快速，适合捕捉急速脉冲，噪音较多
+      &nbsp;|&nbsp;
+      🔴🟢 <b style="color:#dde1f5">趋势</b>：慢速，R²过滤噪音，置信度高
+      &nbsp;|&nbsp;
+      冷却：{alert_cooldown} 分钟（两引擎独立计算）
     </div>""", unsafe_allow_html=True)
 
-# ── 告警历史
+# ── 历史记录
 if st.session_state.alert_history:
-    with st.expander(f"📋 告警历史记录（共 {len(st.session_state.alert_history)} 条）", expanded=False):
+    with st.expander(f"📋 预警历史（共 {len(st.session_state.alert_history)} 条，两引擎合并）",
+                     expanded=False):
         for rec in st.session_state.alert_history:
             sent_icon = "📲" if rec.get("sent") else "🔕"
+            mode_badge = (
+                "<span style='color:#ff8c00;font-size:9px'>[单点]</span>" if rec.get("mode") == "spot"
+                else "<span style='color:#7b7bff;font-size:9px'>[趋势]</span>"
+            )
             st.markdown(f"""
             <div class="alert-box {rec['css']}" style="padding:10px 14px;margin:4px 0">
               <div style="display:flex;justify-content:space-between;align-items:center">
-                <span class="alert-badge {rec['badge']}">{rec['label']}</span>
-                <span class="alert-time">{sent_icon} {rec['time'].strftime('%m-%d %H:%M:%S ET')}</span>
+                <span>{mode_badge} <span class="alert-badge {rec['badge']}" style="font-size:9px">{rec['label']}</span></span>
+                <span class="alert-time">{sent_icon} {rec['time'].strftime('%m-%d %H:%M ET')}</span>
               </div>
-              <div class="alert-msg" style="font-size:12px;margin-top:4px">{rec['desc_html']}</div>
+              <div class="alert-msg" style="font-size:11px;margin-top:4px">{rec['desc_html']}</div>
             </div>""", unsafe_allow_html=True)
+
+
+
 
 
 st.markdown('<div class="sec">01 — 1分钟实时走势（含盘前 04:00 / 盘后 16:00 ET）</div>',

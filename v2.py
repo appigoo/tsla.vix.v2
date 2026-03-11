@@ -565,7 +565,7 @@ with st.sidebar:
 
     # ── 单点变化检测参数
     st.markdown("**① 单点变化（快速预警）**")
-    spot_window      = st.slider("单点观察窗口（分钟）", 2, 15, 5,
+    spot_window      = st.slider("单点观察窗口（分钟）", 1, 15, 5,
                                  help="比较最近 N 分钟首尾变化幅度，反应快但易受噪音影响")
     vix_thresh       = st.slider("VIX 单点变化阈值（%）", 0.3, 5.0, 1.0, step=0.1,
                                  help="VIX 变动超过此值即触发检测")

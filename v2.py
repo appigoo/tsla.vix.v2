@@ -455,7 +455,7 @@ with st.sidebar:
 
     # 背离检测参数
     st.markdown("**背离检测灵敏度**")
-    div_window     = st.slider("观察窗口（分钟数）", 3, 30, 5,
+    div_window     = st.slider("观察窗口（分钟数）", 1, 30, 5,
                                help="用最近 N 根 1 分钟 K 线计算涨跌幅")
     vix_div_thresh = st.slider("VIX 变动阈值（%）", 0.5, 5.0, 1.0, step=0.1,
                                help="VIX 变动超过此值才触发检测")

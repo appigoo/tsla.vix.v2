@@ -5,107 +5,111 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import requests
 from datetime import datetime
+# 需先安裝: pip install streamlit-autorefresh
+from streamlit_autorefresh import st_autorefresh
 
-# --- 1. 配置与 Secrets ---
-st.set_page_config(page_title="TSLA-VIX 领先指标分析", layout="wide")
+# --- 1. 配置與 Secrets ---
+st.set_page_config(page_title="TSLA-VIX 實時自動監控", layout="wide")
 
-# 安全获取 Secrets
+# 安全獲取 Secrets
 try:
     TG_TOKEN = st.secrets["TELEGRAM_TOKEN"]
     TG_CHAT_ID = st.secrets["TELEGRAM_CHAT_ID"]
 except:
-    st.error("请在 .streamlit/secrets.toml 中配置 TELEGRAM_TOKEN 和 TELEGRAM_CHAT_ID")
+    st.error("❌ 錯誤：請在 .streamlit/secrets.toml 中配置 TELEGRAM_TOKEN 和 TELEGRAM_CHAT_ID")
     st.stop()
 
-# --- 2. 核心功能函数 ---
+# --- 2. 自動刷新設置 (放在側邊欄) ---
+st.sidebar.header("⚙️ 系統設置")
+refresh_interval = st.sidebar.selectbox(
+    "選擇自動刷新頻率",
+    options=["1m", "5m", "15m"],
+    index=0,
+    help="系統將根據此時間間隔自動重新加載數據"
+)
+
+# 轉換為毫秒 (1m = 60000ms)
+interval_map = {"1m": 60 * 1000, "5m": 5 * 60 * 1000, "15m": 15 * 60 * 1000}
+st_autorefresh(interval=interval_map[refresh_interval], key="datarefresh")
+
+# --- 3. 核心功能函數 ---
 def send_telegram_msg(text):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": text}
     try:
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        st.error(f"Telegram 发送失败: {e}")
+        st.error(f"Telegram 發送失敗: {e}")
 
-@st.cache_data(ttl=60)
-def fetch_market_data():
-    # 获取最近 5 天的 1 分钟数据 (最适合观察领先关系)
-    # 使用 ^VIX (CBOE Volatility Index) 和 TSLA
+@st.cache_data(ttl=30) # 緩存失效時間略低於刷新頻率
+def fetch_market_data(interval):
+    # 根據選定的頻率調整獲取數據的範圍
+    period_map = {"1m": "1d", "5m": "5d", "15m": "1mo"}
     tickers = ["TSLA", "^VIX"]
-    raw_data = yf.download(tickers, period="5d", interval="1m", group_by='column')
+    
+    raw_data = yf.download(tickers, period=period_map[interval], interval=interval, group_by='column')
     
     if raw_data.empty:
         return pd.DataFrame()
 
-    # 处理 yfinance 可能返回的 MultiIndex (Close, TSLA)
     df = pd.DataFrame()
-    df['TSLA'] = raw_data['Close']['TSLA']
-    df['VIX'] = raw_data['Close']['^VIX']
+    # 處理 yfinance 的 MultiIndex 結構
+    try:
+        df['TSLA'] = raw_data['Close']['TSLA']
+        df['VIX'] = raw_data['Close']['^VIX']
+    except KeyError:
+        # 有時 yfinance 返回格式不同，做個保險
+        df['TSLA'] = raw_data[('Close', 'TSLA')]
+        df['VIX'] = raw_data[('Close', '^VIX')]
     
     return df.dropna()
 
-# --- 3. 页面布局 ---
-st.title("📊 TSLA 与 VIX 指数实时同步分析")
-st.info("原理：VIX 通常领先于高 Beta 股票（如 TSLA）的急跌。本工具通过监控两者‘不同步’的瞬间发出预警。")
+# --- 4. 頁面主體 ---
+st.title("📈 TSLA vs VIX 領先指標實時分析")
+st.write(f"⏱️ 當前自動刷新頻率: **{refresh_interval}** | 最後更新: {datetime.now().strftime('%H:%M:%S')}")
 
-df = fetch_market_data()
+df = fetch_market_data(refresh_interval)
 
 if df.empty:
-    st.warning("暂未获取到实时数据，请检查市场是否开盘或 API 限制。")
+    st.warning("⚠️ 數據獲取失敗。請確認美股是否在交易時段（美東 9:30 - 16:00），或更換刷新頻率。")
 else:
-    # --- 4. 实时统计 ---
+    # --- 數據儀錶盤 ---
     col1, col2, col3 = st.columns(3)
+    curr_tsla = df['TSLA'].iloc[-1]
+    curr_vix = df['VIX'].iloc[-1]
+    corr = df['TSLA'].corr(df['VIX'])
     
-    current_tsla = df['TSLA'].iloc[-1]
-    current_vix = df['VIX'].iloc[-1]
-    # 计算整体相关性
-    total_corr = df['TSLA'].corr(df['VIX'])
-    
-    col1.metric("TSLA 现价", f"${current_tsla:.2f}")
-    col2.metric("VIX 指数", f"{current_vix:.2f}")
-    col3.metric("实时相关系数", f"{total_corr:.2f}", delta="高度负相关" if total_corr < -0.7 else "相关性减弱")
+    col1.metric("TSLA 價格", f"${curr_tsla:.2f}")
+    col2.metric("VIX 指數", f"{curr_vix:.2f}")
+    col3.metric("相關性", f"{corr:.2f}", delta="負相關" if corr < -0.5 else "警告: 相關性異常")
 
-    # --- 5. 领先性证明逻辑 ---
-    st.subheader("🧪 领先性证明：滞后相关性分析")
-    
-    # 计算 VIX 领先 TSLA 不同分钟数时的相关性
-    lags = [0, 1, 3, 5, 10]
-    lag_corrs = {}
-    for lag in lags:
-        # 将 VIX 序列向前移动 (shift)，看它与现在的 TSLA 相关性是否更高
-        c = df['TSLA'].corr(df['VIX'].shift(lag))
-        lag_corrs[f"{lag} min"] = c
-    
-    st.write("当 VIX 移动 N 分钟后的相关性（越负表示领先性越强）：")
-    st.bar_chart(pd.Series(lag_corrs))
+    # --- 異常監控邏輯 ---
+    # 設定波動閾值
+    vix_change = (df['VIX'].iloc[-1] / df['VIX'].iloc[-2]) - 1
+    tsla_change = (df['TSLA'].iloc[-1] / df['TSLA'].iloc[-2]) - 1
 
-    # --- 6. 异常检测与报警 ---
-    # 逻辑：过去 3 分钟 VIX 涨幅 > 1.5% 且 TSLA 跌幅 < 0.2% (说明 TSLA 还没反应过来)
-    if len(df) > 5:
-        vix_move = (df['VIX'].iloc[-1] / df['VIX'].iloc[-3]) - 1
-        tsla_move = (df['TSLA'].iloc[-1] / df['TSLA'].iloc[-3]) - 1
+    # 預警觸發：VIX 漲超過 1% 而 TSLA 沒跌
+    if vix_change > 0.01 and tsla_change > -0.001:
+        alert_msg = f"🔔 【{refresh_interval} 預警】\nVIX 突增 {vix_change:.2%}\nTSLA 尚未跟隨: {tsla_change:.2%}\n數據點: {df.index[-1]}"
+        st.warning(alert_msg)
         
-        if vix_move > 0.015 and tsla_move > -0.002:
-            alert_text = f"🚨 【VIX 领先预警】\nVIX 突增: {vix_move:.2%}\nTSLA 尚未大幅波动: {tsla_move:.2%}\n预测 TSLA 即将面临下行压力！"
-            st.warning(alert_text)
-            
-            # 自动发送 Telegram (这里加个简单的 Session State 防止重复刷屏)
-            if 'last_alert' not in st.session_state or (datetime.now() - st.session_state.last_alert).seconds > 300:
-                send_telegram_msg(alert_text)
-                st.session_state.last_alert = datetime.now()
-                st.success("✅ 预警已发送至 Telegram")
+        # 使用 session_state 防止同一時間點重複發送
+        if 'last_alert_time' not in st.session_state or st.session_state.last_alert_time != df.index[-1]:
+            send_telegram_msg(alert_msg)
+            st.session_state.last_alert_time = df.index[-1]
+            st.success("Telegram 提醒已送出")
 
-    # --- 7. 可视化图表 ---
+    # --- 可視化 ---
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Scatter(x=df.index, y=df['TSLA'], name="TSLA", line=dict(color="#FF4B4B")), secondary_y=False)
     fig.add_trace(go.Scatter(x=df.index, y=df['VIX'], name="VIX", line=dict(color="#00CC96")), secondary_y=True)
     
-    fig.update_layout(title_text="TSLA vs VIX 分钟级走势对比", hovermode="x unified")
+    fig.update_layout(title_text=f"TSLA & VIX ({refresh_interval}) 走勢圖", hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
-    # 滚动相关性
-    st.subheader("🕒 滚动相关性 (30分钟窗口)")
-    rolling = df['TSLA'].rolling(30).corr(df['VIX'])
-    st.line_chart(rolling)
-
-st.divider()
-st.caption(f"最后更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    # --- 滯後相關性分析 ---
+    with st.expander("🔬 點擊查看滯後相關性證明"):
+        lags = [0, 1, 2, 3, 5]
+        lag_results = {f"Lag {l}": df['TSLA'].corr(df['VIX'].shift(l)) for l in lags}
+        st.bar_chart(pd.Series(lag_results))
+        st.write("💡 如果 Lag 1-3 的負相關性比 Lag 0 更強，則證明 VIX 具有領先性。")

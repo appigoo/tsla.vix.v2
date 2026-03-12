@@ -310,21 +310,42 @@ def get_market_session():
     return "post", "盘后交易", ts
 
 
-@st.cache_data(ttl=30)
-def fetch_1min(days_back: int = 5):
-    """1 分钟 K 线，含盘前盘后（prepost=True）"""
-    tsla = yf.download("TSLA", period=f"{days_back}d", interval="1m",
+@st.cache_data(ttl=25)   # 略短于刷新间隔，确保每次都拿新数据
+def fetch_1min(days_back: int = 5, _cache_bust: int = 0):
+    """
+    1 分钟 K 线，含盘前盘后（prepost=True）
+
+    关键修复：
+    - 用 start/end 代替 period，绕过 yfinance 内部的 period 缓存
+    - _cache_bust 参数每次刷新递增，强制 Streamlit 视为新调用
+    """
+    ET_tz = pytz.timezone("America/New_York")
+    now   = datetime.now(ET_tz)
+    # 往前多取1天确保数据完整，end 设为明天避免当天数据被截断
+    start = (now - dt.timedelta(days=days_back + 1)).strftime("%Y-%m-%d")
+    end   = (now + dt.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    tsla = yf.download("TSLA", start=start, end=end, interval="1m",
                         prepost=True, progress=False, auto_adjust=True)
-    vix  = yf.download("^VIX",  period=f"{days_back}d", interval="1m",
+    vix  = yf.download("^VIX",  start=start, end=end, interval="1m",
                         prepost=True, progress=False, auto_adjust=True)
     return tsla, vix
 
 
 @st.cache_data(ttl=60)
 def fetch_history(period: str, interval: str):
-    tsla = yf.download("TSLA", period=period, interval=interval,
+    """历史数据，用 start/end 而非 period 避免 yfinance 内部缓存"""
+    ET_tz = pytz.timezone("America/New_York")
+    now   = datetime.now(ET_tz)
+    # 根据 period 字符串换算 days_back
+    _period_days = {"1d": 1, "5d": 5, "1mo": 30, "3mo": 92,
+                    "6mo": 182, "1y": 365, "2y": 730, "5y": 1825}
+    days_back = _period_days.get(period, 30)
+    start = (now - dt.timedelta(days=days_back + 1)).strftime("%Y-%m-%d")
+    end   = (now + dt.timedelta(days=1)).strftime("%Y-%m-%d")
+    tsla = yf.download("TSLA", start=start, end=end, interval=interval,
                         progress=False, auto_adjust=True)
-    vix  = yf.download("^VIX",  period=period, interval=interval,
+    vix  = yf.download("^VIX",  start=start, end=end, interval=interval,
                         progress=False, auto_adjust=True)
     return tsla, vix
 
@@ -1793,7 +1814,8 @@ st.markdown("---")
 now_str = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
 
 with st.spinner("⏳ 正在拉取 1 分钟实时行情（含盘前数据）…"):
-    tsla_1m_raw, vix_1m_raw = fetch_1min(days_back=5)
+    tsla_1m_raw, vix_1m_raw = fetch_1min(days_back=5,
+                                          _cache_bust=st.session_state.refresh_count)
 
 if tsla_1m_raw.empty or vix_1m_raw.empty:
     st.error("⚠ 数据获取失败，请检查网络或稍后重试。")
@@ -1809,6 +1831,8 @@ if "alert_history" not in st.session_state:
     st.session_state.alert_history = []
 if "last_alert_time" not in st.session_state:
     st.session_state.last_alert_time = {}  # {type_str: datetime}
+if "refresh_count" not in st.session_state:
+    st.session_state.refresh_count = 0
 
 # ══════════════════════════════════════════════════════════
 # 背离仪表板：实时K线检测
@@ -3296,5 +3320,6 @@ st.markdown(f"""
 # ══════════════════════════════════════════════════════════
 if auto_refresh:
     time.sleep(30)
-    st.cache_data.clear()
+    st.session_state.refresh_count = st.session_state.get("refresh_count", 0) + 1
+    st.cache_data.clear()   # 清除其他缓存（期权链、历史数据等）
     st.rerun()

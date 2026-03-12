@@ -971,6 +971,121 @@ def calc_trend(series: pd.Series) -> tuple[float, float, float]:
     return slope_pct, r**2, total_chg
 
 
+def detect_vix_spike(
+    vix_series: pd.Series,
+    spike_pct: float = 3.0,       # 单根 K 线涨跌幅超过此值 → 急速脉冲
+    confirm_pct: float = 2.0,     # 连续 2 根同向 K 线累计涨跌幅 → 确认持续
+    extreme_pct: float = 6.0,     # 超过此值为极端信号
+) -> dict | None:
+    """
+    VIX 1 分钟急升/急跌检测（独立信号）
+
+    检测两种模式：
+    ① 单根脉冲：最后一根 K 线涨跌幅绝对值 ≥ spike_pct
+    ② 连续确认：最后 2 根 K 线方向一致且累计幅度 ≥ confirm_pct
+
+    返回 None（无信号）或 dict（信号详情）
+    """
+    if len(vix_series) < 3:
+        return None
+
+    v = vix_series.values.astype(float)
+    now_ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+
+    last   = v[-1]
+    prev1  = v[-2]
+    prev2  = v[-3]
+
+    # 单根 K 线变化率
+    chg1 = (last  - prev1) / prev1 * 100 if prev1 != 0 else 0.0
+    chg2 = (prev1 - prev2) / prev2 * 100 if prev2 != 0 else 0.0
+    cumulative = (last - prev2) / prev2 * 100 if prev2 != 0 else 0.0
+
+    # 判断是否触发
+    single_spike  = abs(chg1) >= spike_pct
+    double_confirm = (
+        abs(cumulative) >= confirm_pct and
+        np.sign(chg1) == np.sign(chg2) and   # 两根同向
+        abs(chg1) >= spike_pct * 0.4 and      # 第二根也有一定幅度
+        abs(chg2) >= spike_pct * 0.4
+    )
+
+    if not (single_spike or double_confirm):
+        return None
+
+    direction = "up" if chg1 > 0 else "down"
+    is_extreme = abs(chg1) >= extreme_pct or abs(cumulative) >= extreme_pct
+
+    # 触发模式描述
+    if single_spike and double_confirm:
+        mode_label = "单根脉冲＋连续确认"
+        mode_short = "双重确认"
+        confidence = "高" if is_extreme else "中"
+    elif double_confirm:
+        mode_label = "连续两根同向"
+        mode_short = "连续确认"
+        confidence = "中"
+    else:
+        mode_label = "单根脉冲"
+        mode_short = "脉冲"
+        confidence = "极高" if is_extreme else "中"
+
+    if direction == "up":
+        emoji   = "🔺" if is_extreme else "⬆️"
+        label   = f"{'⚡极端' if is_extreme else ''}VIX 急升（{mode_short}）"
+        css     = "div-up"
+        badge   = "divup"
+        meaning = "市场恐慌急速升温，TSLA 面临即时抛压"
+        action  = "⚠️ 立即关注：TSLA 可能即将快速下跌，考虑减仓/止损"
+        tg_head = f"{'⚡' if is_extreme else '🔺'} <b>VIX 1分钟急升警报</b>"
+    else:
+        emoji   = "🔻" if is_extreme else "⬇️"
+        label   = f"{'⚡极端' if is_extreme else ''}VIX 急跌（{mode_short}）"
+        css     = "div-down"
+        badge   = "divdn"
+        meaning = "市场恐慌急速消退，TSLA 或迎来即时反弹"
+        action  = "✅ 立即关注：TSLA 可能即将快速上涨，考虑做多/加仓"
+        tg_head = f"{'⚡' if is_extreme else '🔻'} <b>VIX 1分钟急跌警报</b>"
+
+    msg = (
+        f"{tg_head}\n\n"
+        f"📊 VIX 当前：<b>{last:.2f}</b>\n"
+        f"   最后1根变化：<b>{chg1:+.2f}%</b>（{prev1:.2f} → {last:.2f}）\n"
+        f"   最后2根累计：<b>{cumulative:+.2f}%</b>（{prev2:.2f} → {last:.2f}）\n\n"
+        f"📌 触发模式：{mode_label} · 置信度：{confidence}\n"
+        f"💥 含义：{meaning}\n\n"
+        f"💡 <b>操作参考</b>：{action}\n\n"
+        f"🕐 {now_ts}"
+    )
+
+    desc_html = (
+        f"VIX <b>{chg1:+.2f}%</b>（1根）· 累计 <b>{cumulative:+.2f}%</b>（2根）· "
+        f"{mode_label} · 置信度：{confidence}<br>"
+        f"<span style='color:{'#ff8c00' if direction=='up' else '#3df5b0'}'>{action}</span>"
+    )
+
+    return {
+        "type":       f"vix_spike_{direction}",
+        "direction":  direction,
+        "label":      label,
+        "badge":      badge,
+        "css":        css,
+        "emoji":      emoji,
+        "is_extreme": is_extreme,
+        "chg1":       chg1,
+        "chg2":       chg2,
+        "cumulative": cumulative,
+        "vix_now":    last,
+        "mode":       mode_short,
+        "confidence": confidence,
+        "meaning":    meaning,
+        "action":     action,
+        "desc_html":  desc_html,
+        "msg":        msg,
+    }
+
+
+
 def detect_spot(
     df: pd.DataFrame,
     spot_window: int = 5,
@@ -1166,6 +1281,18 @@ with st.sidebar:
 
     roll_window = st.slider("滚动相关窗口（根 K 线）", 5, 60, 20)
     normalize   = st.checkbox("标准化叠加（Z-Score）", value=True)
+
+    # ── VIX 急速脉冲配置
+    st.markdown('<div class="sec">⚡ VIX 1分钟急升急跌</div>', unsafe_allow_html=True)
+    spike_enabled  = st.checkbox("启用 VIX 急速脉冲检测", value=True)
+    spike_pct      = st.slider("单根脉冲阈值（%）", 1.0, 10.0, 3.0, step=0.5,
+                                help="单根 1 分钟 K 线涨跌幅超过此值即触发")
+    confirm_pct    = st.slider("连续确认阈值（%）", 1.0, 8.0, 2.0, step=0.5,
+                                help="连续 2 根同向 K 线累计幅度超过此值即确认")
+    extreme_pct    = st.slider("极端信号阈值（%）", 3.0, 15.0, 6.0, step=0.5,
+                                help="超过此值升级为⚡极端信号")
+    spike_cooldown = st.slider("急速信号冷却（分钟）", 1, 30, 5,
+                                help="急速脉冲冷却时间，建议较短")
 
     # ── 多因子策略配置
     st.markdown('<div class="sec">🎯 多因子策略胜率</div>', unsafe_allow_html=True)
@@ -1367,6 +1494,67 @@ for sig in all_signals:
             st.session_state.last_alert_time[dtype] = now_dt
             if st.session_state.alert_history:
                 st.session_state.alert_history[0]["sent"] = True
+
+# ══════════════════════════════════════════════════════════
+# VIX 1分钟急升急跌检测（独立信号）
+# ══════════════════════════════════════════════════════════
+if "spike_alert_time" not in st.session_state:
+    st.session_state.spike_alert_time = {}   # {type: datetime}
+if "spike_history" not in st.session_state:
+    st.session_state.spike_history = []
+
+spike_sig    = None
+spike_tg_fired = None
+
+if spike_enabled and len(df1m) >= 3:
+    spike_sig = detect_vix_spike(
+        df1m["VIX"],
+        spike_pct=spike_pct,
+        confirm_pct=confirm_pct,
+        extreme_pct=extreme_pct,
+    )
+
+if spike_sig is not None:
+    spike_now_dt  = datetime.now(ET)
+    spike_now_str = spike_now_dt.strftime("%Y-%m-%d %H:%M:%S ET")
+    spike_type    = spike_sig["type"]
+    spike_last_t  = st.session_state.spike_alert_time.get(spike_type)
+    spike_cool_ok = (
+        spike_last_t is None or
+        (spike_now_dt - spike_last_t).total_seconds() >= spike_cooldown * 60
+    )
+
+    # 写入历史（不受冷却限制）
+    already_sp = (
+        st.session_state.spike_history and
+        st.session_state.spike_history[0]["type"] == spike_type and
+        (spike_now_dt - st.session_state.spike_history[0]["time"]).total_seconds() < 60
+    )
+    if not already_sp:
+        st.session_state.spike_history.insert(0, {
+            "type":       spike_type,
+            "label":      spike_sig["label"],
+            "css":        spike_sig["css"],
+            "badge":      spike_sig["badge"],
+            "emoji":      spike_sig["emoji"],
+            "desc_html":  spike_sig["desc_html"],
+            "chg1":       spike_sig["chg1"],
+            "cumulative": spike_sig["cumulative"],
+            "vix_now":    spike_sig["vix_now"],
+            "is_extreme": spike_sig["is_extreme"],
+            "time":       spike_now_dt,
+            "sent":       False,
+        })
+        st.session_state.spike_history = st.session_state.spike_history[:50]
+
+    # Telegram（独立冷却）
+    if tg_enabled and tg_token and tg_chat_id and spike_cool_ok:
+        ok_sp, err_sp = tg_send(tg_token, tg_chat_id, spike_sig["msg"])
+        spike_tg_fired = (ok_sp, err_sp)
+        if ok_sp:
+            st.session_state.spike_alert_time[spike_type] = spike_now_dt
+            if st.session_state.spike_history:
+                st.session_state.spike_history[0]["sent"] = True
 
 # ══════════════════════════════════════════════════════════
 # 期权流 Put/Call 比率（独立信号）
@@ -2017,6 +2205,170 @@ if r1m is not None:
                      "数值": st.column_config.TextColumn("数值", width=220),
                      "解读": st.column_config.TextColumn("解读"),
                  })
+
+# ══════════════════════════════════════════════════════════
+# VIX 急升急跌面板 UI
+# ══════════════════════════════════════════════════════════
+st.markdown('<div class="sec">⚡ VIX 1分钟急升急跌监控（独立信号）</div>',
+            unsafe_allow_html=True)
+
+if not spike_enabled:
+    st.markdown("""<div style="font-family:'Space Mono',monospace;font-size:11px;
+    color:#5a5c78;padding:14px;border:1px solid #1e1f35;border-radius:10px">
+    📵 急速脉冲检测已关闭，在侧边栏启用「VIX 1分钟急升急跌」</div>""",
+    unsafe_allow_html=True)
+else:
+    sp_col1, sp_col2 = st.columns([3, 2])
+
+    with sp_col1:
+        if spike_sig is not None:
+            s       = spike_sig
+            ac      = "#ff8c00" if s["direction"] == "up" else "#3df5b0"
+            ex_glow = f"box-shadow:0 0 18px {ac}55;" if s["is_extreme"] else ""
+            tg_icon = "📲 已推送" if (spike_tg_fired and spike_tg_fired[0]) else (
+                      f"❌ {spike_tg_fired[1]}" if spike_tg_fired else
+                      ("📡 监控中" if tg_enabled else "📵 未启用"))
+
+            st.markdown(f"""
+            <div class="alert-box {s['css']}" style="{ex_glow}padding:18px 20px">
+              <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+                <span style="font-size:32px">{s['emoji']}</span>
+                <div>
+                  <div class="alert-badge {s['badge']}" style="font-size:13px">
+                    {s['label']}
+                  </div>
+                  <div style="font-family:'Space Mono',monospace;font-size:10px;
+                              color:#5a5c78;margin-top:4px">
+                    置信度：<b style="color:{ac}">{s['confidence']}</b>
+                    &nbsp;·&nbsp; 模式：{s['mode']}
+                  </div>
+                </div>
+              </div>
+
+              <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;
+                          font-family:'Space Mono',monospace;margin-bottom:12px">
+                <div style="background:rgba(0,0,0,.3);border-radius:8px;padding:8px 10px;text-align:center">
+                  <div style="font-size:9px;color:#5a5c78;margin-bottom:3px">最后1根</div>
+                  <div style="font-size:18px;font-weight:700;color:{ac}">{s['chg1']:+.2f}%</div>
+                </div>
+                <div style="background:rgba(0,0,0,.3);border-radius:8px;padding:8px 10px;text-align:center">
+                  <div style="font-size:9px;color:#5a5c78;margin-bottom:3px">2根累计</div>
+                  <div style="font-size:18px;font-weight:700;color:{ac}">{s['cumulative']:+.2f}%</div>
+                </div>
+                <div style="background:rgba(0,0,0,.3);border-radius:8px;padding:8px 10px;text-align:center">
+                  <div style="font-size:9px;color:#5a5c78;margin-bottom:3px">VIX 当前</div>
+                  <div style="font-size:18px;font-weight:700;color:#dde1f5">{s['vix_now']:.2f}</div>
+                </div>
+              </div>
+
+              <div style="background:rgba(0,0,0,.3);border-radius:8px;padding:8px 12px;
+                          font-size:11px;color:#5a5c78;margin-bottom:10px;line-height:1.7">
+                💥 {s['meaning']}
+              </div>
+
+              <div style="background:rgba(0,0,0,.25);border-radius:8px;padding:8px 12px;
+                          font-size:13px;color:{ac};font-weight:700">
+                {s['action']}
+              </div>
+
+              <div class="alert-time" style="margin-top:8px">{tg_icon} · {datetime.now(ET).strftime('%H:%M:%S ET')}</div>
+            </div>""", unsafe_allow_html=True)
+
+            if spike_tg_fired:
+                cl = "ok" if spike_tg_fired[0] else "err"
+                ic = "⚡ 急速信号已推送" if spike_tg_fired[0] else f"❌ {spike_tg_fired[1]}"
+                st.markdown(f'<div class="tg-status {cl}" style="margin-top:6px">{ic}</div>',
+                            unsafe_allow_html=True)
+        else:
+            # 正常状态：显示最近2根 VIX K线变化
+            if len(df1m) >= 3:
+                v     = df1m["VIX"].values.astype(float)
+                c1    = (v[-1] - v[-2]) / v[-2] * 100 if v[-2] != 0 else 0
+                c2    = (v[-2] - v[-3]) / v[-3] * 100 if v[-3] != 0 else 0
+                cum   = (v[-1] - v[-3]) / v[-3] * 100 if v[-3] != 0 else 0
+                col1  = "#ff3d6b" if c1 > 0 else "#3df5b0"
+                col2  = "#ff3d6b" if c2 > 0 else "#3df5b0"
+                colc  = "#ff3d6b" if cum > 0 else "#3df5b0"
+                st.markdown(f"""
+                <div class="kcard t" style="border-left:4px solid #3df5b0;padding:16px 18px">
+                  <div class="klabel">VIX 急速脉冲状态 · 实时监控中</div>
+                  <div style="font-size:18px;font-weight:700;color:#3df5b0;margin:6px 0 12px">
+                    ✅ 未触发（阈值 ±{spike_pct:.1f}%）
+                  </div>
+                  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;
+                              font-family:'Space Mono',monospace">
+                    <div style="background:#141525;border-radius:8px;padding:8px 10px;text-align:center">
+                      <div style="font-size:9px;color:#5a5c78;margin-bottom:3px">最后1根</div>
+                      <div style="font-size:17px;font-weight:700;color:{col1}">{c1:+.2f}%</div>
+                    </div>
+                    <div style="background:#141525;border-radius:8px;padding:8px 10px;text-align:center">
+                      <div style="font-size:9px;color:#5a5c78;margin-bottom:3px">前1根</div>
+                      <div style="font-size:17px;font-weight:700;color:{col2}">{c2:+.2f}%</div>
+                    </div>
+                    <div style="background:#141525;border-radius:8px;padding:8px 10px;text-align:center">
+                      <div style="font-size:9px;color:#5a5c78;margin-bottom:3px">2根累计</div>
+                      <div style="font-size:17px;font-weight:700;color:{colc}">{cum:+.2f}%</div>
+                    </div>
+                  </div>
+                  <div style="font-family:'Space Mono',monospace;font-size:10px;
+                              color:#5a5c78;margin-top:8px">
+                    VIX 当前：{v[-1]:.2f} · 单根触发：±{spike_pct:.1f}% · 极端：±{extreme_pct:.1f}%
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+        # Telegram 总状态
+        if tg_enabled and tg_token and tg_chat_id:
+            st.markdown('<div class="tg-status ok" style="margin-top:6px">📡 VIX 脉冲 Telegram 监控中</div>',
+                        unsafe_allow_html=True)
+        elif not tg_enabled:
+            st.markdown('<div class="tg-status off" style="margin-top:6px">📵 Telegram 已关闭</div>',
+                        unsafe_allow_html=True)
+
+    with sp_col2:
+        # 参数说明 + 历史
+        last_sp_up   = st.session_state.spike_alert_time.get("vix_spike_up")
+        last_sp_down = st.session_state.spike_alert_time.get("vix_spike_down")
+        up_str   = last_sp_up.strftime("%H:%M ET") if last_sp_up else "—"
+        down_str = last_sp_down.strftime("%H:%M ET") if last_sp_down else "—"
+        st.markdown(f"""
+        <div style="font-family:'Space Mono',monospace;font-size:10px;color:#5a5c78;
+                    background:#0e0f1a;border:1px solid #1e1f35;border-radius:10px;
+                    padding:14px 16px;line-height:2.1">
+          <b style="color:#dde1f5">触发条件</b><br>
+          ⬆️ 急升：单根 ≥ +{spike_pct:.1f}%<br>
+          ⬇️ 急跌：单根 ≤ -{spike_pct:.1f}%<br>
+          🔁 确认：2根累计 ≥ ±{confirm_pct:.1f}%（同向）<br>
+          ⚡ 极端：单根/累计 ≥ ±{extreme_pct:.1f}%<br>
+          🔕 冷却：{spike_cooldown} 分钟<br><br>
+          <b style="color:#dde1f5">上次推送</b><br>
+          ⬆️ 急升：{up_str}<br>
+          ⬇️ 急跌：{down_str}
+        </div>""", unsafe_allow_html=True)
+
+    # 历史记录
+    if st.session_state.spike_history:
+        with st.expander(f"📋 VIX 急速信号历史（共 {len(st.session_state.spike_history)} 条）",
+                         expanded=False):
+            for rec in st.session_state.spike_history:
+                sent_icon = "📲" if rec.get("sent") else "🔕"
+                ex_mark   = "⚡" if rec.get("is_extreme") else ""
+                ac2       = "#ff8c00" if "up" in rec["type"] else "#3df5b0"
+                st.markdown(f"""
+                <div class="alert-box {rec['css']}" style="padding:10px 14px;margin:4px 0">
+                  <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span class="alert-badge {rec['badge']}" style="font-size:10px">
+                      {ex_mark}{rec['emoji']} {rec['label']}
+                    </span>
+                    <span class="alert-time">
+                      {sent_icon} {rec['time'].strftime('%m-%d %H:%M:%S ET')}
+                    </span>
+                  </div>
+                  <div style="font-family:'Space Mono',monospace;font-size:11px;
+                              color:#5a5c78;margin-top:4px;line-height:1.7">
+                    VIX={rec['vix_now']:.2f} · 1根 <span style="color:{ac2}">{rec['chg1']:+.2f}%</span>
+                    · 2根累计 <span style="color:{ac2}">{rec['cumulative']:+.2f}%</span>
+                  </div>
+                </div>""", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════
 # 期权流面板 UI

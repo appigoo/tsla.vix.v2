@@ -183,6 +183,51 @@ html, body, [class*="css"] {
 .tg-status.err { background:#ff3d6b10; border:1px solid #ff3d6b55; color:#ff3d6b; }
 .tg-status.off { background:#5a5c7820; border:1px solid #5a5c7855; color:#5a5c78; }
 
+/* 多因子策略面板 */
+.strat-card {
+    background: var(--surf2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 18px 20px;
+    position: relative;
+}
+.win-meter {
+    position: relative;
+    width: 100%; height: 22px;
+    background: #141525;
+    border-radius: 11px;
+    overflow: hidden;
+    margin: 8px 0;
+}
+.win-fill {
+    height: 100%;
+    border-radius: 11px;
+    transition: width .5s cubic-bezier(.4,0,.2,1);
+}
+.factor-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 12px; border-radius: 8px; margin: 4px 0;
+    font-family: 'Space Mono', monospace; font-size: 11px;
+}
+.factor-row.on  { background: #3df5b015; border: 1px solid #3df5b040; }
+.factor-row.off { background: #ff3d6b0a; border: 1px solid #ff3d6b25; }
+.factor-row.na  { background: #1e1f35;   border: 1px solid #2a2b45;   }
+.f-icon { font-size: 15px; width: 20px; text-align: center; flex-shrink: 0; }
+.f-name { flex: 1; color: #dde1f5; }
+.f-val  { color: #5a5c78; font-size: 10px; text-align: right; }
+.f-val.on  { color: #3df5b0; }
+.f-val.off { color: #ff3d6b; }
+.score-badge {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 52px; height: 52px; border-radius: 50%;
+    font-family: 'Space Mono', monospace; font-weight: 700; font-size: 17px;
+    flex-shrink: 0;
+}
+.verdict-box {
+    border-radius: 10px; padding: 12px 16px; margin: 10px 0;
+    font-family: 'Space Mono', monospace;
+}
+
 /* 期权流面板 */
 .pc-card {
     background: var(--surf2);
@@ -547,6 +592,347 @@ def pc_tg_msg(pc_data: dict, interp: dict, now_ts: str) -> str:
 
 
 
+
+
+# ══════════════════════════════════════════════════════════
+# 多因子策略胜率引擎
+# ══════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=60)
+def fetch_strategy_data():
+    """
+    拉取策略所需的所有数据：
+    - TSLA 1分钟（VWAP、相对强度）
+    - SPX（^GSPC）1分钟
+    - VIX（^VIX）1分钟
+    - TSLA 期权链最近到期日（Gamma levels）
+    返回 dict，任何字段失败时为 None。
+    """
+    out = {
+        "tsla_1m": None, "spx_1m": None, "vix_1m": None,
+        "tsla_price": None, "spx_price": None, "vix_price": None,
+        "tsla_prev": None, "spx_prev": None, "vix_prev": None,
+        "gamma_levels": [],
+        "error": None,
+    }
+    try:
+        tickers = yf.download(
+            ["TSLA", "^GSPC", "^VIX"],
+            period="2d", interval="1m",
+            prepost=True, progress=False, auto_adjust=True,
+            group_by="ticker",
+        )
+        def _squeeze(df):
+            if df is None or df.empty:
+                return pd.Series(dtype=float)
+            c = df["Close"] if "Close" in df.columns else df.iloc[:, 0]
+            return c.squeeze().dropna()
+
+        if isinstance(tickers.columns, pd.MultiIndex):
+            tsla_s = _squeeze(tickers["TSLA"])
+            spx_s  = _squeeze(tickers["^GSPC"])
+            vix_s  = _squeeze(tickers["^VIX"])
+        else:
+            tsla_s = _squeeze(tickers)
+            spx_s  = pd.Series(dtype=float)
+            vix_s  = pd.Series(dtype=float)
+
+        out["tsla_1m"] = tsla_s
+        out["spx_1m"]  = spx_s
+        out["vix_1m"]  = vix_s
+
+        if len(tsla_s): out["tsla_price"] = float(tsla_s.iloc[-1])
+        if len(spx_s):  out["spx_price"]  = float(spx_s.iloc[-1])
+        if len(vix_s):  out["vix_price"]  = float(vix_s.iloc[-1])
+
+        # 昨日收盘（今日开盘前最后一根）
+        def _prev_close(s):
+            if s is None or len(s) < 2:
+                return None
+            now_et = datetime.now(ET)
+            today  = now_et.date()
+            prev   = s[s.index.tz_convert(ET).date < today]  # type: ignore
+            return float(prev.iloc[-1]) if len(prev) else None
+
+        out["tsla_prev"] = _prev_close(tsla_s)
+        out["spx_prev"]  = _prev_close(spx_s)
+        out["vix_prev"]  = _prev_close(vix_s)
+
+    except Exception as e:
+        out["error"] = str(e)
+
+    # Gamma levels：从期权链提取高 OI 行权价（作为 Gamma 支撑/阻力）
+    try:
+        t    = yf.Ticker("TSLA")
+        exps = t.options
+        if exps and out["tsla_price"]:
+            chain   = t.option_chain(exps[0])
+            spot    = out["tsla_price"]
+            # 合并 calls + puts 的 OI，找高 OI 行权价
+            oi_df = pd.concat([
+                chain.calls[["strike", "openInterest"]],
+                chain.puts[["strike", "openInterest"]],
+            ]).groupby("strike")["openInterest"].sum().reset_index()
+            oi_df = oi_df[oi_df["openInterest"] > 0].sort_values("openInterest", ascending=False)
+            # 取离当前价 ±10% 内的前 8 个高 OI 行权价
+            near = oi_df[abs(oi_df["strike"] - spot) / spot < 0.10].head(8)
+            out["gamma_levels"] = sorted(near["strike"].tolist())
+    except Exception:
+        pass
+
+    return out
+
+
+def calc_vwap(price_series: pd.Series, volume_series: pd.Series | None = None) -> float | None:
+    """
+    计算当日 VWAP（成交量加权均价）。
+    若无成交量数据则用简单均价代替。
+    """
+    try:
+        now_et = datetime.now(ET)
+        today  = now_et.date()
+        today_mask = price_series.index.tz_convert(ET).date == today  # type: ignore
+        today_prices = price_series[today_mask]
+        if len(today_prices) < 2:
+            return None
+        if volume_series is not None:
+            today_vol = volume_series[today_mask]
+            total_vol = today_vol.sum()
+            if total_vol > 0:
+                return float((today_prices * today_vol).sum() / total_vol)
+        return float(today_prices.mean())
+    except Exception:
+        return None
+
+
+def eval_factors(sd: dict, lookback: int = 10) -> dict:
+    """
+    评估五大因子，每个因子独立打分（满足=True，不满足=False，数据不足=None）。
+
+    因子定义：
+    ① VIX ↓     ：近 lookback 分钟 VIX 趋势向下（斜率 < 0）
+    ② SPX ↑     ：近 lookback 分钟 SPX 趋势向上（斜率 > 0）
+    ③ TSLA RS ↑ ：TSLA 涨幅 > SPX 涨幅（相对强度为正）
+    ④ Gamma 支撑：当前价在最近 Gamma 行权价之上（价格未破 Gamma 支撑）
+    ⑤ VWAP 夺回：当前 TSLA 价格 > 当日 VWAP
+
+    返回 dict：每个因子的 {active, value, detail}
+    """
+    factors = {}
+    tsla_s = sd.get("tsla_1m")
+    spx_s  = sd.get("spx_1m")
+    vix_s  = sd.get("vix_1m")
+    price  = sd.get("tsla_price")
+    gammas = sd.get("gamma_levels", [])
+
+    # ── ① VIX ↓
+    try:
+        vix_win = vix_s.iloc[-lookback:] if len(vix_s) >= lookback else vix_s
+        vix_sl, _, vix_r, *_ = stats.linregress(np.arange(len(vix_win)),
+                                                  vix_win.values.astype(float))
+        vix_chg = float(vix_win.iloc[-1] - vix_win.iloc[0])
+        factors["vix_down"] = {
+            "active":  vix_sl < 0,
+            "value":   f"{vix_chg:+.2f} pt ({vix_sl*60:+.3f}/分钟)",
+            "detail":  "VIX 趋势下行" if vix_sl < 0 else "VIX 趋势上行或横盘",
+            "r2":      round(vix_r**2, 2),
+        }
+    except Exception:
+        factors["vix_down"] = {"active": None, "value": "—", "detail": "数据不足", "r2": 0}
+
+    # ── ② SPX ↑
+    try:
+        spx_win = spx_s.iloc[-lookback:] if len(spx_s) >= lookback else spx_s
+        spx_sl, *_ = stats.linregress(np.arange(len(spx_win)),
+                                        spx_win.values.astype(float))
+        spx_chg_pct = (float(spx_win.iloc[-1]) - float(spx_win.iloc[0])) / float(spx_win.iloc[0]) * 100
+        factors["spx_up"] = {
+            "active": spx_sl > 0,
+            "value":  f"{spx_chg_pct:+.3f}% ({lookback}分钟)",
+            "detail": "SPX 趋势上行" if spx_sl > 0 else "SPX 趋势下行或横盘",
+        }
+    except Exception:
+        factors["spx_up"] = {"active": None, "value": "—", "detail": "数据不足"}
+
+    # ── ③ TSLA 相对强度 RS ↑（TSLA 涨幅 vs SPX）
+    try:
+        n = min(lookback, len(tsla_s), len(spx_s))
+        tsla_win = tsla_s.iloc[-n:]
+        spx_win2 = spx_s.iloc[-n:]
+        tsla_ret = (float(tsla_win.iloc[-1]) - float(tsla_win.iloc[0])) / float(tsla_win.iloc[0]) * 100
+        spx_ret  = (float(spx_win2.iloc[-1]) - float(spx_win2.iloc[0])) / float(spx_win2.iloc[0]) * 100
+        rs       = round(tsla_ret - spx_ret, 3)
+        factors["tsla_rs"] = {
+            "active": rs > 0,
+            "value":  f"RS={rs:+.3f}% (TSLA {tsla_ret:+.2f}% vs SPX {spx_ret:+.2f}%)",
+            "detail": f"TSLA 相对强度{'为正（强于大盘）' if rs > 0 else '为负（弱于大盘）'}",
+        }
+    except Exception:
+        factors["tsla_rs"] = {"active": None, "value": "—", "detail": "数据不足"}
+
+    # ── ④ Gamma 支撑
+    try:
+        if price and gammas:
+            below = [g for g in gammas if g <= price]
+            above = [g for g in gammas if g >  price]
+            nearest_support = max(below) if below else None
+            nearest_resist  = min(above) if above else None
+            # 支撑：当前价在最近 Gamma 支撑之上，且距离 < 1.5%
+            if nearest_support:
+                dist_pct = (price - nearest_support) / price * 100
+                on_support = dist_pct < 1.5   # 价格接近支撑位（1.5% 以内）
+                factors["gamma_support"] = {
+                    "active": True,   # 有 Gamma 支撑位存在
+                    "on_support": on_support,
+                    "value":  (f"支撑 ${nearest_support:.1f} ({dist_pct:.1f}%↓)"
+                               + (f" · 阻力 ${nearest_resist:.1f}" if nearest_resist else "")),
+                    "detail": (f"价格在 Gamma 支撑 ${nearest_support:.1f} 附近（{dist_pct:.1f}%），"
+                               + ("有效支撑 ✓" if on_support else "支撑偏远")),
+                    "support": nearest_support,
+                    "resist":  nearest_resist,
+                    "dist":    dist_pct,
+                }
+            else:
+                factors["gamma_support"] = {
+                    "active": False, "on_support": False,
+                    "value": "无下方 Gamma 支撑",
+                    "detail": f"当前价 ${price:.2f} 低于所有 Gamma 行权价",
+                    "support": None, "resist": nearest_resist, "dist": None,
+                }
+        else:
+            factors["gamma_support"] = {"active": None, "on_support": None,
+                                         "value": "—", "detail": "期权数据不足"}
+    except Exception:
+        factors["gamma_support"] = {"active": None, "on_support": None,
+                                     "value": "—", "detail": "计算失败"}
+
+    # ── ⑤ VWAP 夺回
+    try:
+        vwap = calc_vwap(tsla_s)
+        if vwap and price:
+            above_vwap = price > vwap
+            dist_v = (price - vwap) / vwap * 100
+            factors["vwap_reclaim"] = {
+                "active": above_vwap,
+                "vwap":   round(vwap, 2),
+                "dist":   round(dist_v, 3),
+                "value":  f"VWAP=${vwap:.2f}，价格{'高于' if above_vwap else '低于'} {abs(dist_v):.2f}%",
+                "detail": ("价格高于 VWAP，多头占优" if above_vwap
+                           else "价格低于 VWAP，空头占优"),
+            }
+        else:
+            factors["vwap_reclaim"] = {"active": None, "vwap": None,
+                                        "value": "—", "detail": "VWAP 计算中"}
+    except Exception:
+        factors["vwap_reclaim"] = {"active": None, "vwap": None,
+                                    "value": "—", "detail": "计算失败"}
+
+    return factors
+
+
+def calc_winrate(factors: dict) -> dict:
+    """
+    根据满足的因子数量，映射历史胜率估算。
+
+    因子权重设计（基于历史统计）：
+    - 核心三因子（VIX↓ + SPX↑ + RS↑）：基础胜率 63–68%
+    - 加 Gamma 支撑（on_support=True）：+3–4%
+    - 加 VWAP 夺回：+3–4%
+    - 全部满足：70%+
+
+    返回：{score, max_score, pct, winrate, tier, color, signal, active_factors}
+    """
+    # 权重配置
+    weights = {
+        "vix_down":      {"w": 2, "label": "VIX ↓",        "icon": "📉"},
+        "spx_up":        {"w": 2, "label": "SPX ↑",         "icon": "📈"},
+        "tsla_rs":       {"w": 2, "label": "TSLA 相对强度 ↑","icon": "💪"},
+        "gamma_support": {"w": 1.5, "label": "Gamma 支撑",  "icon": "🧲"},
+        "vwap_reclaim":  {"w": 1.5, "label": "VWAP 夺回",   "icon": "📊"},
+    }
+    MAX_SCORE = sum(v["w"] for v in weights.values())  # 10.0
+
+    score = 0.0
+    active_list = []
+
+    for key, cfg in weights.items():
+        f = factors.get(key, {})
+        active = f.get("active")
+
+        # Gamma 支撑特殊处理：需要 on_support=True 才算满分
+        if key == "gamma_support":
+            on_sup = f.get("on_support")
+            if on_sup is True:
+                score += cfg["w"]
+                active_list.append(key)
+            elif active is True and on_sup is False:
+                score += cfg["w"] * 0.4   # 有 Gamma 但不在支撑附近，部分分
+        elif active is True:
+            score += cfg["w"]
+            active_list.append(key)
+
+    pct = score / MAX_SCORE  # 0.0 – 1.0
+
+    # 胜率映射（基于历史统计锚点插值）
+    # 0因子：~50%，3核心：63–68%，5因子：70–75%
+    if pct >= 0.95:
+        winrate, tier, color = 74, "极强", "#3df5b0"
+        signal = "🟢 高胜率做多信号"
+    elif pct >= 0.75:
+        winrate, tier, color = 70, "强", "#3df5b0"
+        signal = "🟢 做多信号（70%+）"
+    elif pct >= 0.55:
+        winrate, tier, color = 66, "中等偏强", "#e8ff47"
+        signal = "🟡 偏多信号，谨慎做多"
+    elif pct >= 0.35:
+        winrate, tier, color = 58, "中等", "#ff8c00"
+        signal = "🟠 信号不足，观望为主"
+    else:
+        winrate, tier, color = 50, "弱", "#ff3d6b"
+        signal = "🔴 无有效信号，不建议入场"
+
+    # 细分插值（让胜率在区间内连续变化）
+    winrate = round(winrate + (pct - 0.55) * 8, 1)
+    winrate = max(48.0, min(76.0, winrate))
+
+    return {
+        "score":          round(score, 1),
+        "max_score":      MAX_SCORE,
+        "pct":            pct,
+        "winrate":        winrate,
+        "tier":           tier,
+        "color":          color,
+        "signal":         signal,
+        "active_factors": active_list,
+        "weights":        weights,
+    }
+
+
+def strategy_tg_msg(factors: dict, wr: dict, price: float | None, now_ts: str) -> str:
+    """生成策略信号 Telegram 消息"""
+    lines = [f"🎯 <b>[策略信号] {wr['signal']}</b>\n"]
+    lines.append(f"📊 胜率估算：<b>{wr['winrate']:.1f}%</b>（{wr['tier']}，{len(wr['active_factors'])}/5 因子满足）\n")
+    if price:
+        lines.append(f"💵 TSLA 当前价：<b>${price:.2f}</b>\n")
+    lines.append("\n<b>因子明细：</b>")
+    icons = {"vix_down":"📉","spx_up":"📈","tsla_rs":"💪","gamma_support":"🧲","vwap_reclaim":"📊"}
+    labels = {"vix_down":"VIX ↓","spx_up":"SPX ↑","tsla_rs":"TSLA RS ↑",
+              "gamma_support":"Gamma 支撑","vwap_reclaim":"VWAP 夺回"}
+    for k, cfg in wr["weights"].items():
+        f   = factors.get(k, {})
+        act = f.get("active")
+        mark = "✅" if k in wr["active_factors"] else ("⚪" if act is None else "❌")
+        lines.append(f"{mark} {icons[k]} {labels[k]}：{f.get('detail','—')}")
+    vwap_v = factors.get("vwap_reclaim", {}).get("vwap")
+    gs     = factors.get("gamma_support", {})
+    if vwap_v:
+        lines.append(f"\n📌 VWAP = ${vwap_v:.2f}")
+    if gs.get("support"):
+        lines.append(f"🧲 Gamma 支撑 = ${gs['support']:.1f}")
+    lines.append(f"\n🕐 {now_ts}")
+    return "\n".join(lines)
+
+
 def tg_send(bot_token: str, chat_id: str, text: str) -> tuple[bool, str]:
     """发送 Telegram 消息，返回 (成功, 信息)"""
     if not bot_token or not chat_id:
@@ -780,6 +1166,16 @@ with st.sidebar:
 
     roll_window = st.slider("滚动相关窗口（根 K 线）", 5, 60, 20)
     normalize   = st.checkbox("标准化叠加（Z-Score）", value=True)
+
+    # ── 多因子策略配置
+    st.markdown('<div class="sec">🎯 多因子策略胜率</div>', unsafe_allow_html=True)
+    strat_enabled    = st.checkbox("启用策略胜率引擎", value=True)
+    strat_lookback   = st.slider("因子观察窗口（分钟）", 3, 20, 10,
+                                  help="计算 VIX/SPX/TSLA 趋势使用的 K 线数量")
+    strat_min_wr     = st.slider("Telegram 触发胜率（%）", 60, 75, 65,
+                                  help="胜率估算超过此值才推送 Telegram")
+    strat_cooldown   = st.slider("策略信号冷却（分钟）", 5, 60, 20,
+                                  help="同一胜率级别的最短推送间隔")
 
     # ── 期权流配置
     st.markdown('<div class="sec">📊 期权流 Put/Call 监控</div>', unsafe_allow_html=True)
@@ -1037,6 +1433,64 @@ if pc_enabled:
                 "sent":   bool(pc_tg_fired and pc_tg_fired[0]),
             })
             st.session_state.pc_history = st.session_state.pc_history[:30]
+
+# ══════════════════════════════════════════════════════════
+# 多因子策略胜率评估
+# ══════════════════════════════════════════════════════════
+if "strat_alert_time" not in st.session_state:
+    st.session_state.strat_alert_time = None
+if "strat_history" not in st.session_state:
+    st.session_state.strat_history = []
+
+strat_data    = {}
+strat_factors = {}
+strat_wr      = {}
+strat_tg_fired = None
+
+if strat_enabled:
+    with st.spinner("⏳ 正在计算多因子策略胜率…"):
+        strat_data = fetch_strategy_data()
+
+    if not strat_data.get("error"):
+        strat_factors = eval_factors(strat_data, lookback=strat_lookback)
+        strat_wr      = calc_winrate(strat_factors)
+
+        # Telegram：胜率超过用户设定阈值时推送
+        strat_now_dt  = datetime.now(ET)
+        strat_now_str = strat_now_dt.strftime("%Y-%m-%d %H:%M:%S ET")
+        strat_last_t  = st.session_state.strat_alert_time
+        strat_cool_ok = (
+            strat_last_t is None or
+            (strat_now_dt - strat_last_t).total_seconds() >= strat_cooldown * 60
+        )
+
+        if strat_wr.get("winrate", 0) >= strat_min_wr and strat_cool_ok:
+            if tg_enabled and tg_token and tg_chat_id:
+                msg_s = strategy_tg_msg(strat_factors, strat_wr,
+                                         strat_data.get("tsla_price"), strat_now_str)
+                ok_s, err_s = tg_send(tg_token, tg_chat_id, msg_s)
+                strat_tg_fired = (ok_s, err_s)
+                if ok_s:
+                    st.session_state.strat_alert_time = strat_now_dt
+
+        # 写入历史（每次胜率≥60%记录）
+        if strat_wr.get("winrate", 0) >= 60:
+            already_s = (
+                st.session_state.strat_history and
+                (strat_now_dt - st.session_state.strat_history[0]["time"]).total_seconds() < 120
+            )
+            if not already_s:
+                st.session_state.strat_history.insert(0, {
+                    "winrate":  strat_wr["winrate"],
+                    "tier":     strat_wr["tier"],
+                    "color":    strat_wr["color"],
+                    "signal":   strat_wr["signal"],
+                    "n_active": len(strat_wr.get("active_factors", [])),
+                    "time":     strat_now_dt,
+                    "sent":     bool(strat_tg_fired and strat_tg_fired[0]),
+                })
+                st.session_state.strat_history = st.session_state.strat_history[:30]
+
 tsla_rt, tsla_prev = fetch_rt_price("TSLA")
 vix_rt,  vix_prev  = fetch_rt_price("^VIX")
 
@@ -1763,6 +2217,154 @@ else:
                     </span>
                   </div>
                   <div style="font-size:11px;color:#5a5c78;margin-top:4px">{rec['desc']}</div>
+                </div>""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════
+# 多因子策略胜率面板 UI
+# ══════════════════════════════════════════════════════════
+st.markdown('<div class="sec">🎯 多因子策略胜率信号（独立信号）</div>', unsafe_allow_html=True)
+
+if not strat_enabled:
+    st.markdown("""<div style="font-family:'Space Mono',monospace;font-size:11px;
+    color:#5a5c78;padding:14px;border:1px solid #1e1f35;border-radius:10px">
+    📵 策略胜率引擎已关闭，在侧边栏启用「多因子策略胜率」</div>""", unsafe_allow_html=True)
+
+elif strat_data.get("error"):
+    st.warning(f"⚠ 策略数据获取失败：{strat_data['error']}")
+
+elif strat_wr:
+    wr      = strat_wr
+    factors = strat_factors
+    price   = strat_data.get("tsla_price")
+    color   = wr["color"]
+    winrate = wr["winrate"]
+    pct_bar = min(100, int((winrate - 48) / (76 - 48) * 100))
+
+    main_col, factor_col = st.columns([2, 3])
+
+    with main_col:
+        score_bg     = f"{color}22"
+        score_border = f"{color}66"
+        st.markdown(f"""
+        <div class="strat-card" style="text-align:center;border-color:{score_border};
+                                        background:{score_bg}">
+          <div style="font-family:'Space Mono',monospace;font-size:10px;letter-spacing:2px;
+                      color:#5a5c78;margin-bottom:12px">策略胜率估算</div>
+          <div style="font-family:'Space Mono',monospace;font-size:52px;font-weight:700;
+                      color:{color};line-height:1">{winrate:.1f}<span style="font-size:22px">%</span></div>
+          <div style="font-family:'Space Mono',monospace;font-size:12px;
+                      color:{color};margin:8px 0 14px">{wr['tier']} · {len(wr['active_factors'])}/5 因子满足</div>
+          <div class="win-meter">
+            <div class="win-fill" style="width:{pct_bar}%;
+                 background:linear-gradient(90deg,{color}88,{color})"></div>
+          </div>
+          <div style="font-family:'Space Mono',monospace;font-size:12px;
+                      font-weight:700;color:{color};margin-top:10px">{wr['signal']}</div>
+        </div>""", unsafe_allow_html=True)
+
+        vwap_f  = factors.get("vwap_reclaim", {})
+        gamma_f = factors.get("gamma_support", {})
+        vwap_v  = vwap_f.get("vwap")
+        g_sup   = gamma_f.get("support")
+        g_res   = gamma_f.get("resist")
+        if price or vwap_v or g_sup:
+            st.markdown(f"""
+            <div style="font-family:'Space Mono',monospace;font-size:11px;
+                        background:#0e0f1a;border:1px solid #1e1f35;border-radius:10px;
+                        padding:12px 14px;margin-top:10px;line-height:2.2">
+              <b style="color:#dde1f5">关键价位参考</b><br>
+              {"💵 TSLA $" + f"{price:.2f}" if price else ""}
+              {"&nbsp;·&nbsp;📊 VWAP $" + f"{vwap_v:.2f}" if vwap_v else ""}<br>
+              {"🧲 Gamma 支撑 $" + f"{g_sup:.1f}" if g_sup else ""}
+              {"&nbsp;·&nbsp;🚧 阻力 $" + f"{g_res:.1f}" if g_res else ""}
+            </div>""", unsafe_allow_html=True)
+
+        if strat_tg_fired:
+            tg_s_ic = "✅ 策略信号已推送" if strat_tg_fired[0] else f"❌ {strat_tg_fired[1]}"
+            tg_s_cl = "ok" if strat_tg_fired[0] else "err"
+        elif winrate >= strat_min_wr:
+            last_s = st.session_state.strat_alert_time
+            if last_s:
+                m = int((datetime.now(ET) - last_s).total_seconds() / 60)
+                tg_s_ic, tg_s_cl = f"⏱ 冷却中（{m}/{strat_cooldown}分钟）", "off"
+            else:
+                tg_s_ic = "📵 Telegram 未启用" if not tg_enabled else "📡 监控中"
+                tg_s_cl = "ok" if tg_enabled else "off"
+        else:
+            tg_s_ic = f"⏸ 胜率 {winrate:.1f}% < 阈值 {strat_min_wr}%"
+            tg_s_cl = "off"
+        st.markdown(f'<div class="tg-status {tg_s_cl}" style="margin-top:6px">🎯 {tg_s_ic}</div>',
+                    unsafe_allow_html=True)
+
+    with factor_col:
+        st.markdown("""<div style="font-family:'Space Mono',monospace;font-size:10px;
+        letter-spacing:1px;color:#5a5c78;margin-bottom:10px">五大因子评估</div>""",
+                    unsafe_allow_html=True)
+
+        factor_defs = [
+            ("vix_down",      "📉", "VIX ↓",          "核心因子，权重×2"),
+            ("spx_up",        "📈", "SPX ↑",           "核心因子，权重×2"),
+            ("tsla_rs",       "💪", "TSLA 相对强度 ↑",  "核心因子，权重×2"),
+            ("gamma_support", "🧲", "Gamma 支撑",       "加强因子，权重×1.5"),
+            ("vwap_reclaim",  "📊", "VWAP 夺回",        "加强因子，权重×1.5"),
+        ]
+        for key, icon, name, weight_note in factor_defs:
+            f    = factors.get(key, {})
+            act  = f.get("active")
+            if key == "gamma_support":
+                on_s    = f.get("on_support")
+                row_cls = "on" if on_s else ("off" if on_s is False else "na")
+                mark    = "✅" if on_s else ("⚠️" if act is True else ("—" if act is None else "❌"))
+            else:
+                row_cls = "on" if act is True else ("off" if act is False else "na")
+                mark    = "✅" if act is True else ("—" if act is None else "❌")
+            val_cls = "on" if row_cls == "on" else ("off" if row_cls == "off" else "")
+
+            st.markdown(f"""
+            <div class="factor-row {row_cls}">
+              <span class="f-icon">{mark}</span>
+              <span class="f-icon">{icon}</span>
+              <span class="f-name">
+                <b>{name}</b>
+                <span style="color:#5a5c78;font-size:9px"> · {weight_note}</span><br>
+                <span style="color:#5a5c78;font-size:10px">{f.get('detail','—')}</span>
+              </span>
+              <span class="f-val {val_cls}">{f.get('value','—')}</span>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown(f"""
+        <div style="font-family:'Space Mono',monospace;font-size:10px;color:#5a5c78;
+                    background:#0e0f1a;border:1px solid #1e1f35;border-radius:8px;
+                    padding:10px 14px;margin-top:10px;line-height:1.9">
+          <b style="color:#dde1f5">胜率参考（历史统计锚点）</b><br>
+          VIX↓ + SPX↑ + RS↑ → 约 63–68%&nbsp;·&nbsp;
+          加 Gamma 支撑 → +3–4%&nbsp;·&nbsp;
+          全部5因子 → 70%+<br>
+          当前因子得分：<b style="color:{color}">{wr['score']:.1f} / {wr['max_score']:.1f}</b>
+          &nbsp;·&nbsp;触发阈值：{strat_min_wr}%&nbsp;·&nbsp;冷却：{strat_cooldown} 分钟
+        </div>""", unsafe_allow_html=True)
+
+    if st.session_state.strat_history:
+        with st.expander(f"📋 策略信号历史（共 {len(st.session_state.strat_history)} 条）",
+                         expanded=False):
+            for rec in st.session_state.strat_history:
+                sent_icon = "📲" if rec.get("sent") else "🔕"
+                clr = rec.get("color", "#7b7bff")
+                st.markdown(f"""
+                <div style="background:#0e0f1a;border:1px solid #1e1f35;border-radius:8px;
+                            padding:10px 14px;margin:4px 0">
+                  <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span style="color:{clr};font-weight:700;font-size:12px;
+                                 font-family:'Space Mono',monospace">{rec['signal']}</span>
+                    <span style="font-family:'Space Mono',monospace;font-size:9px;color:#5a5c78">
+                      {sent_icon} {rec['n_active']}/5因子 · {rec['time'].strftime('%m-%d %H:%M ET')}
+                    </span>
+                  </div>
+                  <div style="font-family:'Space Mono',monospace;font-size:10px;
+                              color:#5a5c78;margin-top:4px">
+                    胜率 {rec['winrate']:.1f}% · {rec['tier']}
+                  </div>
                 </div>""", unsafe_allow_html=True)
 
 

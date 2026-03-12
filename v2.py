@@ -183,87 +183,6 @@ html, body, [class*="css"] {
 .tg-status.err { background:#ff3d6b10; border:1px solid #ff3d6b55; color:#ff3d6b; }
 .tg-status.off { background:#5a5c7820; border:1px solid #5a5c7855; color:#5a5c78; }
 
-/* 多因子策略面板 */
-.strat-card {
-    background: var(--surf2);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 18px 20px;
-    position: relative;
-}
-.win-meter {
-    position: relative;
-    width: 100%; height: 22px;
-    background: #141525;
-    border-radius: 11px;
-    overflow: hidden;
-    margin: 8px 0;
-}
-.win-fill {
-    height: 100%;
-    border-radius: 11px;
-    transition: width .5s cubic-bezier(.4,0,.2,1);
-}
-.factor-row {
-    display: flex; align-items: center; gap: 10px;
-    padding: 7px 12px; border-radius: 8px; margin: 4px 0;
-    font-family: 'Space Mono', monospace; font-size: 11px;
-}
-.factor-row.on  { background: #3df5b015; border: 1px solid #3df5b040; }
-.factor-row.off { background: #ff3d6b0a; border: 1px solid #ff3d6b25; }
-.factor-row.na  { background: #1e1f35;   border: 1px solid #2a2b45;   }
-.f-icon { font-size: 15px; width: 20px; text-align: center; flex-shrink: 0; }
-.f-name { flex: 1; color: #dde1f5; }
-.f-val  { color: #5a5c78; font-size: 10px; text-align: right; }
-.f-val.on  { color: #3df5b0; }
-.f-val.off { color: #ff3d6b; }
-.score-badge {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 52px; height: 52px; border-radius: 50%;
-    font-family: 'Space Mono', monospace; font-weight: 700; font-size: 17px;
-    flex-shrink: 0;
-}
-.verdict-box {
-    border-radius: 10px; padding: 12px 16px; margin: 10px 0;
-    font-family: 'Space Mono', monospace;
-}
-
-/* 期权流面板 */
-.pc-card {
-    background: var(--surf2);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 16px 20px;
-    position: relative;
-    overflow: hidden;
-}
-.pc-card::after {
-    content:''; position:absolute;
-    top:0; left:0; right:0; height:3px;
-    border-radius:14px 14px 0 0;
-}
-.pc-card.bull::after { background: linear-gradient(90deg,#3df5b0,#00c896); }
-.pc-card.bear::after { background: linear-gradient(90deg,#ff3d6b,#cc0040); }
-.pc-card.neut::after { background: linear-gradient(90deg,#7b7bff,#5555cc); }
-
-.pc-signal {
-    display:inline-flex; align-items:center; gap:8px;
-    border-radius:8px; padding:6px 14px; margin:8px 0;
-    font-family:'Space Mono',monospace; font-size:11px; font-weight:700;
-}
-.pc-signal.bull { background:#3df5b020; border:1px solid #3df5b055; color:#3df5b0; }
-.pc-signal.bear { background:#ff3d6b20; border:1px solid #ff3d6b55; color:#ff3d6b; }
-.pc-signal.neut { background:#7b7bff20; border:1px solid #7b7bff55; color:#7b7bff; }
-
-.pc-bar-wrap {
-    background:#141525; border-radius:6px; height:10px;
-    overflow:hidden; margin:6px 0;
-}
-.pc-bar-fill {
-    height:100%; border-radius:6px;
-    transition: width .4s ease;
-}
-
 #MainMenu, footer, header { visibility:hidden; }
 </style>
 """, unsafe_allow_html=True)
@@ -368,570 +287,9 @@ def tag_session(index, tz=ET):
 
 
 
-
 # ══════════════════════════════════════════════════════════
-# 期权流：Put/Call 比率
+# Telegram 告警函数
 # ══════════════════════════════════════════════════════════
-
-@st.cache_data(ttl=120)   # 2分钟缓存（期权链更新较慢）
-def fetch_pc_ratio(ticker: str = "TSLA") -> dict:
-    """
-    从 yfinance 拉取期权链，计算各到期日的 Put/Call 比率。
-
-    返回 dict：
-      ratio_volume   : 以成交量加权的综合 P/C 比率
-      ratio_oi       : 以未平仓量加权的综合 P/C 比率
-      put_vol        : 总 Put 成交量
-      call_vol       : 总 Call 成交量
-      put_oi         : 总 Put 未平仓量
-      call_oi        : 总 Call 未平仓量
-      by_expiry      : [{expiry, put_vol, call_vol, pc_vol, put_oi, call_oi, pc_oi}, ...]
-      near_expiry    : 最近到期日字符串
-      near_pc_vol    : 最近到期 P/C 成交量比率（更敏感）
-      near_pc_oi     : 最近到期 P/C 未平仓量比率
-      atm_skew       : ATM 附近 Put IV - Call IV（波动率偏斜）
-      timestamp      : 拉取时间
-      error          : 错误信息（正常为 None）
-    """
-    result = {
-        "ratio_volume": None, "ratio_oi": None,
-        "put_vol": 0, "call_vol": 0,
-        "put_oi": 0, "call_oi": 0,
-        "by_expiry": [], "near_expiry": None,
-        "near_pc_vol": None, "near_pc_oi": None,
-        "atm_skew": None,
-        "timestamp": datetime.now(ET).strftime("%H:%M:%S ET"),
-        "error": None,
-    }
-    try:
-        t = yf.Ticker(ticker)
-        exps = t.options  # 所有到期日列表
-        if not exps:
-            result["error"] = "无法获取期权到期日"
-            return result
-
-        # 只取最近 4 个到期日（流动性最好）
-        target_exps = exps[:4]
-        total_pv = total_cv = total_poi = total_coi = 0
-        by_expiry = []
-
-        for exp in target_exps:
-            try:
-                chain = t.option_chain(exp)
-                puts  = chain.puts
-                calls = chain.calls
-
-                pv  = int(puts["volume"].fillna(0).sum())
-                cv  = int(calls["volume"].fillna(0).sum())
-                poi = int(puts["openInterest"].fillna(0).sum())
-                coi = int(calls["openInterest"].fillna(0).sum())
-
-                total_pv  += pv
-                total_cv  += cv
-                total_poi += poi
-                total_coi += coi
-
-                pc_vol = round(pv / cv, 3) if cv > 0 else None
-                pc_oi  = round(poi / coi, 3) if coi > 0 else None
-
-                by_expiry.append({
-                    "expiry":   exp,
-                    "put_vol":  pv,  "call_vol":  cv,  "pc_vol":  pc_vol,
-                    "put_oi":   poi, "call_oi":   coi, "pc_oi":   pc_oi,
-                })
-            except Exception:
-                continue
-
-        result["put_vol"]  = total_pv
-        result["call_vol"] = total_cv
-        result["put_oi"]   = total_poi
-        result["call_oi"]  = total_coi
-        result["by_expiry"] = by_expiry
-
-        if total_cv > 0:
-            result["ratio_volume"] = round(total_pv / total_cv, 3)
-        if total_coi > 0:
-            result["ratio_oi"] = round(total_poi / total_coi, 3)
-
-        # 最近到期日详情
-        if by_expiry:
-            near = by_expiry[0]
-            result["near_expiry"]  = near["expiry"]
-            result["near_pc_vol"]  = near["pc_vol"]
-            result["near_pc_oi"]   = near["pc_oi"]
-
-        # ATM 波动率偏斜（最近到期日）
-        try:
-            spot = t.fast_info.last_price or 0
-            chain0 = t.option_chain(exps[0])
-            puts0  = chain0.puts.copy()
-            calls0 = chain0.calls.copy()
-            puts0["dist"]  = abs(puts0["strike"]  - spot)
-            calls0["dist"] = abs(calls0["strike"] - spot)
-            near_put  = puts0.nsmallest(3, "dist")
-            near_call = calls0.nsmallest(3, "dist")
-            avg_put_iv  = float(near_put["impliedVolatility"].mean())
-            avg_call_iv = float(near_call["impliedVolatility"].mean())
-            result["atm_skew"] = round((avg_put_iv - avg_call_iv) * 100, 2)
-        except Exception:
-            pass
-
-        return result
-    except Exception as e:
-        result["error"] = str(e)
-        return result
-
-
-def interpret_pc(ratio_vol: float | None, ratio_oi: float | None,
-                 near_vol: float | None, atm_skew: float | None) -> dict:
-    """
-    根据 P/C 比率生成交易信号。
-
-    P/C 比率解读（TSLA 历史经验值）：
-      < 0.5  → 过度乐观（Call 主导），逆向看：短期可能见顶，偏空参考
-      0.5–0.7→ 轻微看涨情绪，市场整体偏多
-      0.7–1.0→ 中性，多空均衡
-      1.0–1.3→ 偏向防御/看跌，市场情绪谨慎
-      > 1.3  → 过度悲观（Put 主导），逆向看：短期可能见底，偏多参考
-    """
-    # 主信号基于成交量比率（更实时），辅以 OI 比率
-    primary = ratio_vol if ratio_vol is not None else ratio_oi
-
-    if primary is None:
-        return {
-            "signal": "neutral", "css": "neut", "emoji": "⚪",
-            "label": "数据不足", "action": "—",
-            "strength": 0, "desc": "无法获取期权数据",
-            "tg_worthy": False,
-        }
-
-    # 信号强度（0–100）
-    if primary < 0.4:
-        signal, css, emoji = "bearish_contrarian", "bear", "🔴"
-        label  = "极度看涨情绪（逆向偏空）"
-        action = "⚠️ Call 严重堆积，市场过热，逆向参考：留意短期回调风险"
-        strength = int(min(100, (0.4 - primary) / 0.4 * 100 + 60))
-        tg_worthy = True
-    elif primary < 0.6:
-        signal, css, emoji = "bullish", "bull", "🟢"
-        label  = "看涨情绪偏强"
-        action = "✅ Call 主导，市场偏多，顺势参考：TSLA 短期看涨"
-        strength = int(60 + (0.6 - primary) / 0.2 * 20)
-        tg_worthy = primary < 0.5
-    elif primary < 0.85:
-        signal, css, emoji = "neutral", "neut", "🔵"
-        label  = "市场情绪中性"
-        action = "📊 多空均衡，无明显方向性信号"
-        strength = 50
-        tg_worthy = False
-    elif primary < 1.1:
-        signal, css, emoji = "cautious", "neut", "🟡"
-        label  = "谨慎/轻微偏空"
-        action = "⚠️ Put 略多，市场出现防御迹象，关注支撑位"
-        strength = int(50 + (primary - 0.85) / 0.25 * 20)
-        tg_worthy = False
-    elif primary < 1.5:
-        signal, css, emoji = "bearish", "bear", "🔴"
-        label  = "看空情绪偏强"
-        action = "⚠️ Put 主导，市场偏空，顺势参考：TSLA 短期承压"
-        strength = int(65 + (primary - 1.1) / 0.4 * 20)
-        tg_worthy = True
-    else:
-        signal, css, emoji = "bullish_contrarian", "bull", "🟢"
-        label  = "极度看空情绪（逆向偏多）"
-        action = "✅ Put 严重堆积，恐慌见底信号，逆向参考：考虑做多"
-        strength = int(min(100, (primary - 1.5) / 0.5 * 100 + 70))
-        tg_worthy = True
-
-    # 附加信息：ATM 偏斜
-    skew_note = ""
-    if atm_skew is not None:
-        if atm_skew > 5:
-            skew_note = f"Put IV 溢价 {atm_skew:.1f}%（市场对下行风险定价偏高）"
-        elif atm_skew < -3:
-            skew_note = f"Call IV 溢价 {abs(atm_skew):.1f}%（市场对上行动能定价偏高）"
-        else:
-            skew_note = f"ATM 偏斜中性（{atm_skew:+.1f}%）"
-
-    desc = f"综合 P/C={primary:.3f}"
-    if near_vol:
-        desc += f"，近月 P/C={near_vol:.3f}"
-    if skew_note:
-        desc += f"，{skew_note}"
-
-    return {
-        "signal": signal, "css": css, "emoji": emoji,
-        "label": label, "action": action,
-        "strength": strength, "desc": desc,
-        "tg_worthy": tg_worthy,
-        "primary": primary,
-    }
-
-
-def pc_tg_msg(pc_data: dict, interp: dict, now_ts: str) -> str:
-    """生成期权流 Telegram 消息"""
-    rv = pc_data.get("ratio_volume")
-    ro = pc_data.get("ratio_oi")
-    nv = pc_data.get("near_pc_vol")
-    sk = pc_data.get("atm_skew")
-    pv = pc_data.get("put_vol", 0)
-    cv = pc_data.get("call_vol", 0)
-
-    skew_str = f"{sk:+.1f}%" if sk is not None else "N/A"
-    return (
-        f"{interp['emoji']} <b>[期权流信号] {interp['label']}</b>\n\n"
-        f"📊 Put/Call 成交量比率：<b>{rv:.3f}</b>\n"
-        f"📊 Put/Call 未平仓量比率：<b>{ro:.3f}</b>\n"
-        f"📊 近月 P/C 成交量：<b>{nv:.3f}</b>\n\n"
-        f"📈 总 Call 成交量：{cv:,}\n"
-        f"📉 总 Put 成交量：{pv:,}\n"
-        f"⚖️ ATM 波动率偏斜：{skew_str}\n\n"
-        f"💡 <b>操作参考</b>：{interp['action']}\n\n"
-        f"🕐 {now_ts}"
-    )
-
-
-
-
-
-# ══════════════════════════════════════════════════════════
-# 多因子策略胜率引擎
-# ══════════════════════════════════════════════════════════
-
-@st.cache_data(ttl=60)
-def fetch_strategy_data():
-    """
-    拉取策略所需的所有数据：
-    - TSLA 1分钟（VWAP、相对强度）
-    - SPX（^GSPC）1分钟
-    - VIX（^VIX）1分钟
-    - TSLA 期权链最近到期日（Gamma levels）
-    返回 dict，任何字段失败时为 None。
-    """
-    out = {
-        "tsla_1m": None, "spx_1m": None, "vix_1m": None,
-        "tsla_price": None, "spx_price": None, "vix_price": None,
-        "tsla_prev": None, "spx_prev": None, "vix_prev": None,
-        "gamma_levels": [],
-        "error": None,
-    }
-    try:
-        tickers = yf.download(
-            ["TSLA", "^GSPC", "^VIX"],
-            period="2d", interval="1m",
-            prepost=True, progress=False, auto_adjust=True,
-            group_by="ticker",
-        )
-        def _squeeze(df):
-            if df is None or df.empty:
-                return pd.Series(dtype=float)
-            c = df["Close"] if "Close" in df.columns else df.iloc[:, 0]
-            return c.squeeze().dropna()
-
-        if isinstance(tickers.columns, pd.MultiIndex):
-            tsla_s = _squeeze(tickers["TSLA"])
-            spx_s  = _squeeze(tickers["^GSPC"])
-            vix_s  = _squeeze(tickers["^VIX"])
-        else:
-            tsla_s = _squeeze(tickers)
-            spx_s  = pd.Series(dtype=float)
-            vix_s  = pd.Series(dtype=float)
-
-        out["tsla_1m"] = tsla_s
-        out["spx_1m"]  = spx_s
-        out["vix_1m"]  = vix_s
-
-        if len(tsla_s): out["tsla_price"] = float(tsla_s.iloc[-1])
-        if len(spx_s):  out["spx_price"]  = float(spx_s.iloc[-1])
-        if len(vix_s):  out["vix_price"]  = float(vix_s.iloc[-1])
-
-        # 昨日收盘（今日开盘前最后一根）
-        def _prev_close(s):
-            if s is None or len(s) < 2:
-                return None
-            now_et = datetime.now(ET)
-            today  = now_et.date()
-            prev   = s[s.index.tz_convert(ET).date < today]  # type: ignore
-            return float(prev.iloc[-1]) if len(prev) else None
-
-        out["tsla_prev"] = _prev_close(tsla_s)
-        out["spx_prev"]  = _prev_close(spx_s)
-        out["vix_prev"]  = _prev_close(vix_s)
-
-    except Exception as e:
-        out["error"] = str(e)
-
-    # Gamma levels：从期权链提取高 OI 行权价（作为 Gamma 支撑/阻力）
-    try:
-        t    = yf.Ticker("TSLA")
-        exps = t.options
-        if exps and out["tsla_price"]:
-            chain   = t.option_chain(exps[0])
-            spot    = out["tsla_price"]
-            # 合并 calls + puts 的 OI，找高 OI 行权价
-            oi_df = pd.concat([
-                chain.calls[["strike", "openInterest"]],
-                chain.puts[["strike", "openInterest"]],
-            ]).groupby("strike")["openInterest"].sum().reset_index()
-            oi_df = oi_df[oi_df["openInterest"] > 0].sort_values("openInterest", ascending=False)
-            # 取离当前价 ±10% 内的前 8 个高 OI 行权价
-            near = oi_df[abs(oi_df["strike"] - spot) / spot < 0.10].head(8)
-            out["gamma_levels"] = sorted(near["strike"].tolist())
-    except Exception:
-        pass
-
-    return out
-
-
-def calc_vwap(price_series: pd.Series, volume_series: pd.Series | None = None) -> float | None:
-    """
-    计算当日 VWAP（成交量加权均价）。
-    若无成交量数据则用简单均价代替。
-    """
-    try:
-        now_et = datetime.now(ET)
-        today  = now_et.date()
-        today_mask = price_series.index.tz_convert(ET).date == today  # type: ignore
-        today_prices = price_series[today_mask]
-        if len(today_prices) < 2:
-            return None
-        if volume_series is not None:
-            today_vol = volume_series[today_mask]
-            total_vol = today_vol.sum()
-            if total_vol > 0:
-                return float((today_prices * today_vol).sum() / total_vol)
-        return float(today_prices.mean())
-    except Exception:
-        return None
-
-
-def eval_factors(sd: dict, lookback: int = 10) -> dict:
-    """
-    评估五大因子，每个因子独立打分（满足=True，不满足=False，数据不足=None）。
-
-    因子定义：
-    ① VIX ↓     ：近 lookback 分钟 VIX 趋势向下（斜率 < 0）
-    ② SPX ↑     ：近 lookback 分钟 SPX 趋势向上（斜率 > 0）
-    ③ TSLA RS ↑ ：TSLA 涨幅 > SPX 涨幅（相对强度为正）
-    ④ Gamma 支撑：当前价在最近 Gamma 行权价之上（价格未破 Gamma 支撑）
-    ⑤ VWAP 夺回：当前 TSLA 价格 > 当日 VWAP
-
-    返回 dict：每个因子的 {active, value, detail}
-    """
-    factors = {}
-    tsla_s = sd.get("tsla_1m")
-    spx_s  = sd.get("spx_1m")
-    vix_s  = sd.get("vix_1m")
-    price  = sd.get("tsla_price")
-    gammas = sd.get("gamma_levels", [])
-
-    # ── ① VIX ↓
-    try:
-        vix_win = vix_s.iloc[-lookback:] if len(vix_s) >= lookback else vix_s
-        vix_sl, _, vix_r, *_ = stats.linregress(np.arange(len(vix_win)),
-                                                  vix_win.values.astype(float))
-        vix_chg = float(vix_win.iloc[-1] - vix_win.iloc[0])
-        factors["vix_down"] = {
-            "active":  vix_sl < 0,
-            "value":   f"{vix_chg:+.2f} pt ({vix_sl*60:+.3f}/分钟)",
-            "detail":  "VIX 趋势下行" if vix_sl < 0 else "VIX 趋势上行或横盘",
-            "r2":      round(vix_r**2, 2),
-        }
-    except Exception:
-        factors["vix_down"] = {"active": None, "value": "—", "detail": "数据不足", "r2": 0}
-
-    # ── ② SPX ↑
-    try:
-        spx_win = spx_s.iloc[-lookback:] if len(spx_s) >= lookback else spx_s
-        spx_sl, *_ = stats.linregress(np.arange(len(spx_win)),
-                                        spx_win.values.astype(float))
-        spx_chg_pct = (float(spx_win.iloc[-1]) - float(spx_win.iloc[0])) / float(spx_win.iloc[0]) * 100
-        factors["spx_up"] = {
-            "active": spx_sl > 0,
-            "value":  f"{spx_chg_pct:+.3f}% ({lookback}分钟)",
-            "detail": "SPX 趋势上行" if spx_sl > 0 else "SPX 趋势下行或横盘",
-        }
-    except Exception:
-        factors["spx_up"] = {"active": None, "value": "—", "detail": "数据不足"}
-
-    # ── ③ TSLA 相对强度 RS ↑（TSLA 涨幅 vs SPX）
-    try:
-        n = min(lookback, len(tsla_s), len(spx_s))
-        tsla_win = tsla_s.iloc[-n:]
-        spx_win2 = spx_s.iloc[-n:]
-        tsla_ret = (float(tsla_win.iloc[-1]) - float(tsla_win.iloc[0])) / float(tsla_win.iloc[0]) * 100
-        spx_ret  = (float(spx_win2.iloc[-1]) - float(spx_win2.iloc[0])) / float(spx_win2.iloc[0]) * 100
-        rs       = round(tsla_ret - spx_ret, 3)
-        factors["tsla_rs"] = {
-            "active": rs > 0,
-            "value":  f"RS={rs:+.3f}% (TSLA {tsla_ret:+.2f}% vs SPX {spx_ret:+.2f}%)",
-            "detail": f"TSLA 相对强度{'为正（强于大盘）' if rs > 0 else '为负（弱于大盘）'}",
-        }
-    except Exception:
-        factors["tsla_rs"] = {"active": None, "value": "—", "detail": "数据不足"}
-
-    # ── ④ Gamma 支撑
-    try:
-        if price and gammas:
-            below = [g for g in gammas if g <= price]
-            above = [g for g in gammas if g >  price]
-            nearest_support = max(below) if below else None
-            nearest_resist  = min(above) if above else None
-            # 支撑：当前价在最近 Gamma 支撑之上，且距离 < 1.5%
-            if nearest_support:
-                dist_pct = (price - nearest_support) / price * 100
-                on_support = dist_pct < 1.5   # 价格接近支撑位（1.5% 以内）
-                factors["gamma_support"] = {
-                    "active": True,   # 有 Gamma 支撑位存在
-                    "on_support": on_support,
-                    "value":  (f"支撑 ${nearest_support:.1f} ({dist_pct:.1f}%↓)"
-                               + (f" · 阻力 ${nearest_resist:.1f}" if nearest_resist else "")),
-                    "detail": (f"价格在 Gamma 支撑 ${nearest_support:.1f} 附近（{dist_pct:.1f}%），"
-                               + ("有效支撑 ✓" if on_support else "支撑偏远")),
-                    "support": nearest_support,
-                    "resist":  nearest_resist,
-                    "dist":    dist_pct,
-                }
-            else:
-                factors["gamma_support"] = {
-                    "active": False, "on_support": False,
-                    "value": "无下方 Gamma 支撑",
-                    "detail": f"当前价 ${price:.2f} 低于所有 Gamma 行权价",
-                    "support": None, "resist": nearest_resist, "dist": None,
-                }
-        else:
-            factors["gamma_support"] = {"active": None, "on_support": None,
-                                         "value": "—", "detail": "期权数据不足"}
-    except Exception:
-        factors["gamma_support"] = {"active": None, "on_support": None,
-                                     "value": "—", "detail": "计算失败"}
-
-    # ── ⑤ VWAP 夺回
-    try:
-        vwap = calc_vwap(tsla_s)
-        if vwap and price:
-            above_vwap = price > vwap
-            dist_v = (price - vwap) / vwap * 100
-            factors["vwap_reclaim"] = {
-                "active": above_vwap,
-                "vwap":   round(vwap, 2),
-                "dist":   round(dist_v, 3),
-                "value":  f"VWAP=${vwap:.2f}，价格{'高于' if above_vwap else '低于'} {abs(dist_v):.2f}%",
-                "detail": ("价格高于 VWAP，多头占优" if above_vwap
-                           else "价格低于 VWAP，空头占优"),
-            }
-        else:
-            factors["vwap_reclaim"] = {"active": None, "vwap": None,
-                                        "value": "—", "detail": "VWAP 计算中"}
-    except Exception:
-        factors["vwap_reclaim"] = {"active": None, "vwap": None,
-                                    "value": "—", "detail": "计算失败"}
-
-    return factors
-
-
-def calc_winrate(factors: dict) -> dict:
-    """
-    根据满足的因子数量，映射历史胜率估算。
-
-    因子权重设计（基于历史统计）：
-    - 核心三因子（VIX↓ + SPX↑ + RS↑）：基础胜率 63–68%
-    - 加 Gamma 支撑（on_support=True）：+3–4%
-    - 加 VWAP 夺回：+3–4%
-    - 全部满足：70%+
-
-    返回：{score, max_score, pct, winrate, tier, color, signal, active_factors}
-    """
-    # 权重配置
-    weights = {
-        "vix_down":      {"w": 2, "label": "VIX ↓",        "icon": "📉"},
-        "spx_up":        {"w": 2, "label": "SPX ↑",         "icon": "📈"},
-        "tsla_rs":       {"w": 2, "label": "TSLA 相对强度 ↑","icon": "💪"},
-        "gamma_support": {"w": 1.5, "label": "Gamma 支撑",  "icon": "🧲"},
-        "vwap_reclaim":  {"w": 1.5, "label": "VWAP 夺回",   "icon": "📊"},
-    }
-    MAX_SCORE = sum(v["w"] for v in weights.values())  # 10.0
-
-    score = 0.0
-    active_list = []
-
-    for key, cfg in weights.items():
-        f = factors.get(key, {})
-        active = f.get("active")
-
-        # Gamma 支撑特殊处理：需要 on_support=True 才算满分
-        if key == "gamma_support":
-            on_sup = f.get("on_support")
-            if on_sup is True:
-                score += cfg["w"]
-                active_list.append(key)
-            elif active is True and on_sup is False:
-                score += cfg["w"] * 0.4   # 有 Gamma 但不在支撑附近，部分分
-        elif active is True:
-            score += cfg["w"]
-            active_list.append(key)
-
-    pct = score / MAX_SCORE  # 0.0 – 1.0
-
-    # 胜率映射（基于历史统计锚点插值）
-    # 0因子：~50%，3核心：63–68%，5因子：70–75%
-    if pct >= 0.95:
-        winrate, tier, color = 74, "极强", "#3df5b0"
-        signal = "🟢 高胜率做多信号"
-    elif pct >= 0.75:
-        winrate, tier, color = 70, "强", "#3df5b0"
-        signal = "🟢 做多信号（70%+）"
-    elif pct >= 0.55:
-        winrate, tier, color = 66, "中等偏强", "#e8ff47"
-        signal = "🟡 偏多信号，谨慎做多"
-    elif pct >= 0.35:
-        winrate, tier, color = 58, "中等", "#ff8c00"
-        signal = "🟠 信号不足，观望为主"
-    else:
-        winrate, tier, color = 50, "弱", "#ff3d6b"
-        signal = "🔴 无有效信号，不建议入场"
-
-    # 细分插值（让胜率在区间内连续变化）
-    winrate = round(winrate + (pct - 0.55) * 8, 1)
-    winrate = max(48.0, min(76.0, winrate))
-
-    return {
-        "score":          round(score, 1),
-        "max_score":      MAX_SCORE,
-        "pct":            pct,
-        "winrate":        winrate,
-        "tier":           tier,
-        "color":          color,
-        "signal":         signal,
-        "active_factors": active_list,
-        "weights":        weights,
-    }
-
-
-def strategy_tg_msg(factors: dict, wr: dict, price: float | None, now_ts: str) -> str:
-    """生成策略信号 Telegram 消息"""
-    lines = [f"🎯 <b>[策略信号] {wr['signal']}</b>\n"]
-    lines.append(f"📊 胜率估算：<b>{wr['winrate']:.1f}%</b>（{wr['tier']}，{len(wr['active_factors'])}/5 因子满足）\n")
-    if price:
-        lines.append(f"💵 TSLA 当前价：<b>${price:.2f}</b>\n")
-    lines.append("\n<b>因子明细：</b>")
-    icons = {"vix_down":"📉","spx_up":"📈","tsla_rs":"💪","gamma_support":"🧲","vwap_reclaim":"📊"}
-    labels = {"vix_down":"VIX ↓","spx_up":"SPX ↑","tsla_rs":"TSLA RS ↑",
-              "gamma_support":"Gamma 支撑","vwap_reclaim":"VWAP 夺回"}
-    for k, cfg in wr["weights"].items():
-        f   = factors.get(k, {})
-        act = f.get("active")
-        mark = "✅" if k in wr["active_factors"] else ("⚪" if act is None else "❌")
-        lines.append(f"{mark} {icons[k]} {labels[k]}：{f.get('detail','—')}")
-    vwap_v = factors.get("vwap_reclaim", {}).get("vwap")
-    gs     = factors.get("gamma_support", {})
-    if vwap_v:
-        lines.append(f"\n📌 VWAP = ${vwap_v:.2f}")
-    if gs.get("support"):
-        lines.append(f"🧲 Gamma 支撑 = ${gs['support']:.1f}")
-    lines.append(f"\n🕐 {now_ts}")
-    return "\n".join(lines)
-
 
 def tg_send(bot_token: str, chat_id: str, text: str) -> tuple[bool, str]:
     """发送 Telegram 消息，返回 (成功, 信息)"""
@@ -969,121 +327,6 @@ def calc_trend(series: pd.Series) -> tuple[float, float, float]:
     slope_pct = (slope / mean_val * 100) if mean_val != 0 else 0.0
     total_chg = (y[-1] - y[0]) / y[0] * 100 if y[0] != 0 else 0.0
     return slope_pct, r**2, total_chg
-
-
-def detect_vix_spike(
-    vix_series: pd.Series,
-    spike_pct: float = 3.0,       # 单根 K 线涨跌幅超过此值 → 急速脉冲
-    confirm_pct: float = 2.0,     # 连续 2 根同向 K 线累计涨跌幅 → 确认持续
-    extreme_pct: float = 6.0,     # 超过此值为极端信号
-) -> dict | None:
-    """
-    VIX 1 分钟急升/急跌检测（独立信号）
-
-    检测两种模式：
-    ① 单根脉冲：最后一根 K 线涨跌幅绝对值 ≥ spike_pct
-    ② 连续确认：最后 2 根 K 线方向一致且累计幅度 ≥ confirm_pct
-
-    返回 None（无信号）或 dict（信号详情）
-    """
-    if len(vix_series) < 3:
-        return None
-
-    v = vix_series.values.astype(float)
-    now_ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
-
-    last   = v[-1]
-    prev1  = v[-2]
-    prev2  = v[-3]
-
-    # 单根 K 线变化率
-    chg1 = (last  - prev1) / prev1 * 100 if prev1 != 0 else 0.0
-    chg2 = (prev1 - prev2) / prev2 * 100 if prev2 != 0 else 0.0
-    cumulative = (last - prev2) / prev2 * 100 if prev2 != 0 else 0.0
-
-    # 判断是否触发
-    single_spike  = abs(chg1) >= spike_pct
-    double_confirm = (
-        abs(cumulative) >= confirm_pct and
-        np.sign(chg1) == np.sign(chg2) and   # 两根同向
-        abs(chg1) >= spike_pct * 0.4 and      # 第二根也有一定幅度
-        abs(chg2) >= spike_pct * 0.4
-    )
-
-    if not (single_spike or double_confirm):
-        return None
-
-    direction = "up" if chg1 > 0 else "down"
-    is_extreme = abs(chg1) >= extreme_pct or abs(cumulative) >= extreme_pct
-
-    # 触发模式描述
-    if single_spike and double_confirm:
-        mode_label = "单根脉冲＋连续确认"
-        mode_short = "双重确认"
-        confidence = "高" if is_extreme else "中"
-    elif double_confirm:
-        mode_label = "连续两根同向"
-        mode_short = "连续确认"
-        confidence = "中"
-    else:
-        mode_label = "单根脉冲"
-        mode_short = "脉冲"
-        confidence = "极高" if is_extreme else "中"
-
-    if direction == "up":
-        emoji   = "🔺" if is_extreme else "⬆️"
-        label   = f"{'⚡极端' if is_extreme else ''}VIX 急升（{mode_short}）"
-        css     = "div-up"
-        badge   = "divup"
-        meaning = "市场恐慌急速升温，TSLA 面临即时抛压"
-        action  = "⚠️ 立即关注：TSLA 可能即将快速下跌，考虑减仓/止损"
-        tg_head = f"{'⚡' if is_extreme else '🔺'} <b>VIX 1分钟急升警报</b>"
-    else:
-        emoji   = "🔻" if is_extreme else "⬇️"
-        label   = f"{'⚡极端' if is_extreme else ''}VIX 急跌（{mode_short}）"
-        css     = "div-down"
-        badge   = "divdn"
-        meaning = "市场恐慌急速消退，TSLA 或迎来即时反弹"
-        action  = "✅ 立即关注：TSLA 可能即将快速上涨，考虑做多/加仓"
-        tg_head = f"{'⚡' if is_extreme else '🔻'} <b>VIX 1分钟急跌警报</b>"
-
-    msg = (
-        f"{tg_head}\n\n"
-        f"📊 VIX 当前：<b>{last:.2f}</b>\n"
-        f"   最后1根变化：<b>{chg1:+.2f}%</b>（{prev1:.2f} → {last:.2f}）\n"
-        f"   最后2根累计：<b>{cumulative:+.2f}%</b>（{prev2:.2f} → {last:.2f}）\n\n"
-        f"📌 触发模式：{mode_label} · 置信度：{confidence}\n"
-        f"💥 含义：{meaning}\n\n"
-        f"💡 <b>操作参考</b>：{action}\n\n"
-        f"🕐 {now_ts}"
-    )
-
-    desc_html = (
-        f"VIX <b>{chg1:+.2f}%</b>（1根）· 累计 <b>{cumulative:+.2f}%</b>（2根）· "
-        f"{mode_label} · 置信度：{confidence}<br>"
-        f"<span style='color:{'#ff8c00' if direction=='up' else '#3df5b0'}'>{action}</span>"
-    )
-
-    return {
-        "type":       f"vix_spike_{direction}",
-        "direction":  direction,
-        "label":      label,
-        "badge":      badge,
-        "css":        css,
-        "emoji":      emoji,
-        "is_extreme": is_extreme,
-        "chg1":       chg1,
-        "chg2":       chg2,
-        "cumulative": cumulative,
-        "vix_now":    last,
-        "mode":       mode_short,
-        "confidence": confidence,
-        "meaning":    meaning,
-        "action":     action,
-        "desc_html":  desc_html,
-        "msg":        msg,
-    }
-
 
 
 def detect_spot(
@@ -1165,138 +408,95 @@ def detect_spot(
 
 def detect_trend(
     df: pd.DataFrame,
-    trend_window: int = 10,       # 用户设定（现在仅作 EMA span 参考）
+    trend_window: int = 10,
     vix_slope_thresh: float = 0.05,
     tsla_slope_thresh: float = 0.02,
-    min_r2: float = 0.5,          # 保留参数名兼容侧边栏，但不再用 R² 作主要门槛
+    min_r2: float = 0.5,
 ) -> dict | None:
     """
-    ② EMA 斜率趋势确认（快速高置信版）
-
-    原线性回归需要 10 根 K 线才稳定，本版改用：
-      · EMA(3) 斜率：3 根指数加权均线，对最新数据权重更高，响应快 3–5 分钟
-      · 连续方向计数：最近 N 根 K 线中有几根与趋势同向（替代 R² 门槛）
-      · 双重确认：EMA 斜率 + 连续方向数同时满足才触发
-
-    优点：3–4 分钟内即可确认趋势，且噪音容忍度可调
+    ② 线性回归趋势检测（高置信度确认）
+    逻辑：对最近 trend_window 根 K 线做线性回归，检测持续方向性趋势
+    优点：过滤锯齿噪音，只响应真正的趋势性移动（R² 门槛）
+    缺点：反应稍慢，需要趋势持续一段时间才触发
     """
-    # 最少需要 ema_span*2 根数据才稳定
-    ema_span = max(3, min(trend_window // 2, 5))   # 3–5，随窗口自适应
-    min_bars = ema_span * 2 + 2
-    if len(df) < min_bars:
+    if len(df) < trend_window + 2:
         return None
 
-    # ── EMA 斜率计算
-    vix_ema   = df["VIX"].ewm(span=ema_span, adjust=False).mean()
-    tsla_ema  = df["TSLA"].ewm(span=ema_span, adjust=False).mean()
-
-    # 最后3根 EMA 斜率（%/根）
-    def _ema_slope(ema_s):
-        vals = ema_s.iloc[-3:].values.astype(float)
-        if vals[0] == 0:
-            return 0.0
-        # 平均斜率（最后两段的均值）
-        s1 = (vals[1] - vals[0]) / vals[0] * 100
-        s2 = (vals[2] - vals[1]) / vals[1] * 100
-        return (s1 + s2) / 2
-
-    vix_ema_slope  = _ema_slope(vix_ema)
-    tsla_ema_slope = _ema_slope(tsla_ema)
-
-    # ── 连续方向计数（最近 N 根原始 K 线有几根同向）
-    check_n = min(trend_window, len(df) - 1, 6)   # 最多检查 6 根
-    vix_vals  = df["VIX"].iloc[-(check_n+1):].values.astype(float)
-    tsla_vals = df["TSLA"].iloc[-(check_n+1):].values.astype(float)
-
-    vix_up_count  = sum(1 for i in range(1, len(vix_vals))  if vix_vals[i]  > vix_vals[i-1])
-    vix_dn_count  = sum(1 for i in range(1, len(vix_vals))  if vix_vals[i]  < vix_vals[i-1])
-    tsla_up_count = sum(1 for i in range(1, len(tsla_vals)) if tsla_vals[i] > tsla_vals[i-1])
-    tsla_dn_count = sum(1 for i in range(1, len(tsla_vals)) if tsla_vals[i] < tsla_vals[i-1])
-
-    # 方向一致性：60% 以上同向视为趋势（比 R²≥0.5 等效但响应更快）
-    min_count = max(2, int(check_n * 0.6))
+    recent = df.iloc[-trend_window:].copy()
+    vix_slope,  vix_r2,  vix_total  = calc_trend(recent["VIX"])
+    tsla_slope, tsla_r2, tsla_total = calc_trend(recent["TSLA"])
 
     now_ts   = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
-    vix_now  = float(df["VIX"].iloc[-1])
-    tsla_now = float(df["TSLA"].iloc[-1])
-    vix_total  = (vix_now - float(df["VIX"].iloc[-check_n])) / float(df["VIX"].iloc[-check_n]) * 100
-    tsla_total = (tsla_now - float(df["TSLA"].iloc[-check_n])) / float(df["TSLA"].iloc[-check_n]) * 100
+    vix_now  = float(recent["VIX"].iloc[-1])
+    tsla_now = float(recent["TSLA"].iloc[-1])
+    strength = "强" if vix_r2 >= 0.75 else "中等"
 
-    # 置信度标签（用方向计数替代 R²）
-    def _conf(count, total):
-        ratio = count / total if total > 0 else 0
-        return "高" if ratio >= 0.8 else "中等"
-
-    # ── 🔴 VIX EMA 上升 + 方向确认 + TSLA 未跟跌
-    if (vix_ema_slope  >= vix_slope_thresh   and   # EMA 斜率向上
-        vix_up_count   >= min_count          and   # 方向一致性（快速 R² 替代）
-        tsla_ema_slope >= -tsla_slope_thresh):      # TSLA EMA 未同步下行
-
-        conf = _conf(vix_up_count, check_n)
+    # VIX 持续上升趋势，TSLA 未跟跌
+    if (vix_slope  >=  vix_slope_thresh and
+        vix_r2     >=  min_r2           and
+        tsla_slope >= -tsla_slope_thresh):
         return {
             "type":       "trend_vix_up",
             "mode":       "trend",
-            "label":      "🔴 趋势确认：VIX升势 TSLA未跌",
+            "label":      "🔴 趋势确认：VIX持续升 TSLA未跌",
             "badge":      "divup",
             "css":        "div-up",
             "emoji":      "🔴",
-            "vix_slope":  vix_ema_slope,
-            "tsla_slope": tsla_ema_slope,
-            "vix_r2":     round(vix_up_count / check_n, 2),   # 用方向一致率代替 R²
+            "vix_slope":  vix_slope,
+            "tsla_slope": tsla_slope,
+            "vix_r2":     vix_r2,
             "action":     "⚠️ 趋势确认：TSLA 补跌概率高（减仓/做空）",
             "msg": (
-                f"🔴 <b>[趋势确认·EMA] VIX 升势持续，TSLA 尚未跟跌</b>\n\n"
-                f"📈 VIX EMA({ema_span}) 斜率：<b>{vix_ema_slope:+.3f}%/根</b>\n"
-                f"   {check_n} 根中 <b>{vix_up_count}</b> 根上升（方向一致率 {vix_up_count/check_n:.0%}，{conf}置信）\n"
+                f"🔴 <b>[趋势确认] VIX 持续上升，TSLA 尚未跟跌</b>\n\n"
+                f"📈 VIX 趋势（过去 {trend_window} 分钟）\n"
+                f"   斜率：{vix_slope:+.3f}%/分钟  |  R²={vix_r2:.2f}（{strength}趋势）\n"
                 f"   累计涨幅：{vix_total:+.2f}%  |  当前：{vix_now:.2f}\n\n"
-                f"😴 TSLA EMA 斜率：<b>{tsla_ema_slope:+.3f}%/根</b>（未同步下跌）\n"
-                f"   当前：${tsla_now:.2f}\n\n"
-                f"📌 恐慌升势已形成（{conf}置信），TSLA 大概率跟随补跌。\n"
+                f"😴 TSLA 同期走势\n"
+                f"   斜率：{tsla_slope:+.3f}%/分钟  |  当前：${tsla_now:.2f}\n\n"
+                f"📌 持续性恐慌趋势已形成（R²={vix_r2:.2f}），置信度高。\n"
+                f"   TSLA 补跌概率显著，非短期脉冲。\n\n"
                 f"💡 建议减仓或做空，并设置止损位。\n\n"
                 f"🕐 {now_ts}"
             ),
             "desc_html": (
-                f"<b style='color:#ff3d6b'>[趋势·EMA{ema_span}]</b> "
-                f"VIX 斜率 <b>{vix_ema_slope:+.3f}%/根</b>，"
-                f"{check_n}根中 <b>{vix_up_count}</b> 根同向（{conf}置信），"
-                f"TSLA 未跟跌<br>"
+                f"<b style='color:#ff3d6b'>[趋势]</b> "
+                f"VIX 斜率 <b>{vix_slope:+.3f}%/分钟</b>（R²={vix_r2:.2f}，{strength}），"
+                f"TSLA 斜率仅 <b>{tsla_slope:+.3f}%/分钟</b><br>"
                 f"<span style='color:#ff8c00'>⚠ 趋势确认 · TSLA 补跌概率高 · 减仓/做空</span>"
             ),
         }
 
-    # ── 🟢 VIX EMA 下降 + 方向确认 + TSLA 未跟涨
-    if (vix_ema_slope  <= -vix_slope_thresh  and
-        vix_dn_count   >= min_count          and
-        tsla_ema_slope <=  tsla_slope_thresh):
-
-        conf = _conf(vix_dn_count, check_n)
+    # VIX 持续下降趋势，TSLA 未跟涨
+    if (vix_slope  <= -vix_slope_thresh and
+        vix_r2     >=  min_r2           and
+        tsla_slope <=  tsla_slope_thresh):
         return {
             "type":       "trend_vix_down",
             "mode":       "trend",
-            "label":      "🟢 趋势确认：VIX降势 TSLA未涨",
+            "label":      "🟢 趋势确认：VIX持续降 TSLA未涨",
             "badge":      "divdn",
             "css":        "div-down",
             "emoji":      "🟢",
-            "vix_slope":  vix_ema_slope,
-            "tsla_slope": tsla_ema_slope,
-            "vix_r2":     round(vix_dn_count / check_n, 2),
+            "vix_slope":  vix_slope,
+            "tsla_slope": tsla_slope,
+            "vix_r2":     vix_r2,
             "action":     "✅ 趋势确认：TSLA 补涨概率高（做多/加仓）",
             "msg": (
-                f"🟢 <b>[趋势确认·EMA] VIX 降势持续，TSLA 尚未跟涨</b>\n\n"
-                f"📉 VIX EMA({ema_span}) 斜率：<b>{vix_ema_slope:+.3f}%/根</b>\n"
-                f"   {check_n} 根中 <b>{vix_dn_count}</b> 根下降（方向一致率 {vix_dn_count/check_n:.0%}，{conf}置信）\n"
+                f"🟢 <b>[趋势确认] VIX 持续下降，TSLA 尚未跟涨</b>\n\n"
+                f"📉 VIX 趋势（过去 {trend_window} 分钟）\n"
+                f"   斜率：{vix_slope:+.3f}%/分钟  |  R²={vix_r2:.2f}（{strength}趋势）\n"
                 f"   累计跌幅：{vix_total:+.2f}%  |  当前：{vix_now:.2f}\n\n"
-                f"😴 TSLA EMA 斜率：<b>{tsla_ema_slope:+.3f}%/根</b>（未同步上涨）\n"
-                f"   当前：${tsla_now:.2f}\n\n"
-                f"📌 恐慌消退趋势已形成（{conf}置信），TSLA 大概率跟随补涨。\n"
+                f"😴 TSLA 同期走势\n"
+                f"   斜率：{tsla_slope:+.3f}%/分钟  |  当前：${tsla_now:.2f}\n\n"
+                f"📌 持续性恐慌消退趋势已形成（R²={vix_r2:.2f}），置信度高。\n"
+                f"   TSLA 补涨概率显著，非短期脉冲反弹。\n\n"
                 f"💡 建议做多或加仓，关注上行动能确认。\n\n"
                 f"🕐 {now_ts}"
             ),
             "desc_html": (
-                f"<b style='color:#3df5b0'>[趋势·EMA{ema_span}]</b> "
-                f"VIX 斜率 <b>{vix_ema_slope:+.3f}%/根</b>，"
-                f"{check_n}根中 <b>{vix_dn_count}</b> 根同向（{conf}置信），"
-                f"TSLA 未跟涨<br>"
+                f"<b style='color:#3df5b0'>[趋势]</b> "
+                f"VIX 斜率 <b>{vix_slope:+.3f}%/分钟</b>（R²={vix_r2:.2f}，{strength}），"
+                f"TSLA 斜率仅 <b>{tsla_slope:+.3f}%/分钟</b><br>"
                 f"<span style='color:#3df5b0'>✅ 趋势确认 · TSLA 补涨概率高 · 做多/加仓</span>"
             ),
         }
@@ -1324,38 +524,6 @@ with st.sidebar:
 
     roll_window = st.slider("滚动相关窗口（根 K 线）", 5, 60, 20)
     normalize   = st.checkbox("标准化叠加（Z-Score）", value=True)
-
-    # ── VIX 急速脉冲配置
-    st.markdown('<div class="sec">⚡ VIX 1分钟急升急跌</div>', unsafe_allow_html=True)
-    spike_enabled  = st.checkbox("启用 VIX 急速脉冲检测", value=True)
-    spike_pct      = st.slider("单根脉冲阈值（%）", 1.0, 10.0, 3.0, step=0.5,
-                                help="单根 1 分钟 K 线涨跌幅超过此值即触发")
-    confirm_pct    = st.slider("连续确认阈值（%）", 1.0, 8.0, 2.0, step=0.5,
-                                help="连续 2 根同向 K 线累计幅度超过此值即确认")
-    extreme_pct    = st.slider("极端信号阈值（%）", 3.0, 15.0, 6.0, step=0.5,
-                                help="超过此值升级为⚡极端信号")
-    spike_cooldown = st.slider("急速信号冷却（分钟）", 1, 30, 5,
-                                help="急速脉冲冷却时间，建议较短")
-
-    # ── 多因子策略配置
-    st.markdown('<div class="sec">🎯 多因子策略胜率</div>', unsafe_allow_html=True)
-    strat_enabled    = st.checkbox("启用策略胜率引擎", value=True)
-    strat_lookback   = st.slider("因子观察窗口（分钟）", 3, 20, 10,
-                                  help="计算 VIX/SPX/TSLA 趋势使用的 K 线数量")
-    strat_min_wr     = st.slider("Telegram 触发胜率（%）", 60, 75, 65,
-                                  help="胜率估算超过此值才推送 Telegram")
-    strat_cooldown   = st.slider("策略信号冷却（分钟）", 5, 60, 20,
-                                  help="同一胜率级别的最短推送间隔")
-
-    # ── 期权流配置
-    st.markdown('<div class="sec">📊 期权流 Put/Call 监控</div>', unsafe_allow_html=True)
-    pc_enabled     = st.checkbox("启用期权流信号", value=True)
-    pc_bull_thresh = st.slider("看涨信号阈值（P/C <）", 0.3, 0.8, 0.6, step=0.05,
-                               help="P/C 低于此值触发看涨/逆向偏空预警")
-    pc_bear_thresh = st.slider("看空信号阈值（P/C >）", 0.8, 2.0, 1.1, step=0.05,
-                               help="P/C 高于此值触发看空/逆向偏多预警")
-    pc_cooldown    = st.slider("期权流冷却时间（分钟）", 5, 120, 30,
-                               help="期权链数据更新慢，建议冷却时间较长")
 
     # ── Telegram 告警配置 ────────────────────────────────
     st.markdown('<div class="sec">📲 Telegram 告警设置</div>', unsafe_allow_html=True)
@@ -1397,7 +565,7 @@ with st.sidebar:
 
     # ── 单点变化检测参数
     st.markdown("**① 单点变化（快速预警）**")
-    spot_window      = st.slider("单点观察窗口（分钟）", 2, 15, 5,
+    spot_window      = st.slider("单点观察窗口（分钟）", 1, 15, 5,
                                  help="比较最近 N 分钟首尾变化幅度，反应快但易受噪音影响")
     vix_thresh       = st.slider("VIX 单点变化阈值（%）", 0.3, 5.0, 1.0, step=0.1,
                                  help="VIX 变动超过此值即触发检测")
@@ -1406,8 +574,8 @@ with st.sidebar:
 
     # ── 趋势回归检测参数
     st.markdown("**② 线性趋势（高置信确认）**")
-    trend_window      = st.slider("趋势观察窗口（分钟）", 4, 20, 6,
-                                  help="EMA span 自动取窗口的一半（3–5），检查最近 min(窗口,6) 根 K 线方向一致性")
+    trend_window      = st.slider("趋势观察窗口（分钟）", 5, 30, 10,
+                                  help="对最近 N 分钟做线性回归，过滤噪音，只响应持续趋势")
     vix_slope_thresh  = st.slider("VIX 趋势斜率阈值（%/分钟）", 0.01, 0.20, 0.05, step=0.01,
                                   help="VIX 每分钟需涨/跌超过此值才视为有效趋势")
     tsla_slope_thresh = st.slider("TSLA 斜率容忍度（%/分钟）", 0.01, 0.10, 0.02, step=0.01,
@@ -1538,190 +706,7 @@ for sig in all_signals:
             if st.session_state.alert_history:
                 st.session_state.alert_history[0]["sent"] = True
 
-# ══════════════════════════════════════════════════════════
-# VIX 1分钟急升急跌检测（独立信号）
-# ══════════════════════════════════════════════════════════
-if "spike_alert_time" not in st.session_state:
-    st.session_state.spike_alert_time = {}   # {type: datetime}
-if "spike_history" not in st.session_state:
-    st.session_state.spike_history = []
-
-spike_sig    = None
-spike_tg_fired = None
-
-if spike_enabled and len(df1m) >= 3:
-    spike_sig = detect_vix_spike(
-        df1m["VIX"],
-        spike_pct=spike_pct,
-        confirm_pct=confirm_pct,
-        extreme_pct=extreme_pct,
-    )
-
-if spike_sig is not None:
-    spike_now_dt  = datetime.now(ET)
-    spike_now_str = spike_now_dt.strftime("%Y-%m-%d %H:%M:%S ET")
-    spike_type    = spike_sig["type"]
-    spike_last_t  = st.session_state.spike_alert_time.get(spike_type)
-    spike_cool_ok = (
-        spike_last_t is None or
-        (spike_now_dt - spike_last_t).total_seconds() >= spike_cooldown * 60
-    )
-
-    # 写入历史（不受冷却限制）
-    already_sp = (
-        st.session_state.spike_history and
-        st.session_state.spike_history[0]["type"] == spike_type and
-        (spike_now_dt - st.session_state.spike_history[0]["time"]).total_seconds() < 60
-    )
-    if not already_sp:
-        st.session_state.spike_history.insert(0, {
-            "type":       spike_type,
-            "label":      spike_sig["label"],
-            "css":        spike_sig["css"],
-            "badge":      spike_sig["badge"],
-            "emoji":      spike_sig["emoji"],
-            "desc_html":  spike_sig["desc_html"],
-            "chg1":       spike_sig["chg1"],
-            "cumulative": spike_sig["cumulative"],
-            "vix_now":    spike_sig["vix_now"],
-            "is_extreme": spike_sig["is_extreme"],
-            "time":       spike_now_dt,
-            "sent":       False,
-        })
-        st.session_state.spike_history = st.session_state.spike_history[:50]
-
-    # Telegram（独立冷却）
-    if tg_enabled and tg_token and tg_chat_id and spike_cool_ok:
-        ok_sp, err_sp = tg_send(tg_token, tg_chat_id, spike_sig["msg"])
-        spike_tg_fired = (ok_sp, err_sp)
-        if ok_sp:
-            st.session_state.spike_alert_time[spike_type] = spike_now_dt
-            if st.session_state.spike_history:
-                st.session_state.spike_history[0]["sent"] = True
-
-# ══════════════════════════════════════════════════════════
-# 期权流 Put/Call 比率（独立信号）
-# ══════════════════════════════════════════════════════════
-if "pc_alert_time" not in st.session_state:
-    st.session_state.pc_alert_time = None
-if "pc_history" not in st.session_state:
-    st.session_state.pc_history = []
-
-pc_data   = {}
-pc_interp = {}
-pc_tg_fired = None
-
-if pc_enabled:
-    with st.spinner("⏳ 正在拉取 TSLA 期权链数据…"):
-        pc_data = fetch_pc_ratio("TSLA")
-
-    pc_interp = interpret_pc(
-        pc_data.get("ratio_volume"),
-        pc_data.get("ratio_oi"),
-        pc_data.get("near_pc_vol"),
-        pc_data.get("atm_skew"),
-    )
-
-    # 用用户自定义阈值覆盖默认触发判断
-    primary_pc = pc_data.get("ratio_volume") or pc_data.get("ratio_oi")
-    if primary_pc is not None:
-        if primary_pc < pc_bull_thresh or primary_pc > pc_bear_thresh:
-            pc_interp["tg_worthy"] = True
-        else:
-            pc_interp["tg_worthy"] = False
-
-    pc_now_dt  = datetime.now(ET)
-    pc_now_str = pc_now_dt.strftime("%Y-%m-%d %H:%M:%S ET")
-    pc_last_t  = st.session_state.pc_alert_time
-    pc_cooldown_ok = (
-        pc_last_t is None or
-        (pc_now_dt - pc_last_t).total_seconds() >= pc_cooldown * 60
-    )
-
-    # Telegram 推送（独立冷却）
-    if pc_interp.get("tg_worthy") and pc_cooldown_ok:
-        if tg_enabled and tg_token and tg_chat_id:
-            msg_pc = pc_tg_msg(pc_data, pc_interp, pc_now_str)
-            ok_pc, err_pc = tg_send(tg_token, tg_chat_id, msg_pc)
-            pc_tg_fired = (ok_pc, err_pc)
-            if ok_pc:
-                st.session_state.pc_alert_time = pc_now_dt
-
-    # 写入期权流历史
-    if pc_interp.get("tg_worthy"):
-        already_pc = (
-            st.session_state.pc_history and
-            (pc_now_dt - st.session_state.pc_history[0]["time"]).total_seconds() < 120
-        )
-        if not already_pc and primary_pc is not None:
-            st.session_state.pc_history.insert(0, {
-                "label":  pc_interp["label"],
-                "css":    pc_interp["css"],
-                "emoji":  pc_interp["emoji"],
-                "desc":   pc_interp["desc"],
-                "ratio":  primary_pc,
-                "time":   pc_now_dt,
-                "sent":   bool(pc_tg_fired and pc_tg_fired[0]),
-            })
-            st.session_state.pc_history = st.session_state.pc_history[:30]
-
-# ══════════════════════════════════════════════════════════
-# 多因子策略胜率评估
-# ══════════════════════════════════════════════════════════
-if "strat_alert_time" not in st.session_state:
-    st.session_state.strat_alert_time = None
-if "strat_history" not in st.session_state:
-    st.session_state.strat_history = []
-
-strat_data    = {}
-strat_factors = {}
-strat_wr      = {}
-strat_tg_fired = None
-
-if strat_enabled:
-    with st.spinner("⏳ 正在计算多因子策略胜率…"):
-        strat_data = fetch_strategy_data()
-
-    if not strat_data.get("error"):
-        strat_factors = eval_factors(strat_data, lookback=strat_lookback)
-        strat_wr      = calc_winrate(strat_factors)
-
-        # Telegram：胜率超过用户设定阈值时推送
-        strat_now_dt  = datetime.now(ET)
-        strat_now_str = strat_now_dt.strftime("%Y-%m-%d %H:%M:%S ET")
-        strat_last_t  = st.session_state.strat_alert_time
-        strat_cool_ok = (
-            strat_last_t is None or
-            (strat_now_dt - strat_last_t).total_seconds() >= strat_cooldown * 60
-        )
-
-        if strat_wr.get("winrate", 0) >= strat_min_wr and strat_cool_ok:
-            if tg_enabled and tg_token and tg_chat_id:
-                msg_s = strategy_tg_msg(strat_factors, strat_wr,
-                                         strat_data.get("tsla_price"), strat_now_str)
-                ok_s, err_s = tg_send(tg_token, tg_chat_id, msg_s)
-                strat_tg_fired = (ok_s, err_s)
-                if ok_s:
-                    st.session_state.strat_alert_time = strat_now_dt
-
-        # 写入历史（每次胜率≥60%记录）
-        if strat_wr.get("winrate", 0) >= 60:
-            already_s = (
-                st.session_state.strat_history and
-                (strat_now_dt - st.session_state.strat_history[0]["time"]).total_seconds() < 120
-            )
-            if not already_s:
-                st.session_state.strat_history.insert(0, {
-                    "winrate":  strat_wr["winrate"],
-                    "tier":     strat_wr["tier"],
-                    "color":    strat_wr["color"],
-                    "signal":   strat_wr["signal"],
-                    "n_active": len(strat_wr.get("active_factors", [])),
-                    "time":     strat_now_dt,
-                    "sent":     bool(strat_tg_fired and strat_tg_fired[0]),
-                })
-                st.session_state.strat_history = st.session_state.strat_history[:30]
-
+# ── 实时报价
 tsla_rt, tsla_prev = fetch_rt_price("TSLA")
 vix_rt,  vix_prev  = fetch_rt_price("^VIX")
 
@@ -1835,22 +820,9 @@ st.markdown('<div class="sec">🚨 双引擎预警监控（单点快速 + 趋势
 
 # 实时趋势数值（用于正常状态显示）
 _r_spot  = df1m.iloc[-spot_window:] if len(df1m) >= spot_window else df1m
-_r_trend = df1m.iloc[-(trend_window*2+2):] if len(df1m) >= trend_window*2+2 else df1m
-_ema_span = max(3, min(trend_window // 2, 5))
-_vix_ema  = _r_trend["VIX"].ewm(span=_ema_span, adjust=False).mean()
-_tsla_ema = _r_trend["TSLA"].ewm(span=_ema_span, adjust=False).mean()
-def _quick_slope(s):
-    v = s.iloc[-3:].values.astype(float)
-    if len(v) < 3 or v[0] == 0: return 0.0
-    return ((v[1]-v[0])/v[0]*100 + (v[2]-v[1])/v[1]*100) / 2
-_vix_slope  = _quick_slope(_vix_ema)
-_tsla_slope = _quick_slope(_tsla_ema)
-_check_n = min(trend_window, len(_r_trend)-1, 6)
-_vix_vals = _r_trend["VIX"].iloc[-(_check_n+1):].values.astype(float)
-_vix_up_c = sum(1 for i in range(1, len(_vix_vals)) if _vix_vals[i] > _vix_vals[i-1])
-_vix_dn_c = sum(1 for i in range(1, len(_vix_vals)) if _vix_vals[i] < _vix_vals[i-1])
-_dir_count = max(_vix_up_c, _vix_dn_c)
-_vix_r2 = round(_dir_count / _check_n, 2) if _check_n > 0 else 0.0
+_r_trend = df1m.iloc[-trend_window:] if len(df1m) >= trend_window else df1m
+_vix_slope,  _vix_r2,  _ = calc_trend(_r_trend["VIX"])
+_tsla_slope, _tsla_r2, _ = calc_trend(_r_trend["TSLA"])
 
 # 单点窗口涨跌幅
 if len(df1m) >= spot_window + 1:
@@ -1937,7 +909,7 @@ with panel_trend:
             <span style="color:{vc2}">VIX {va2} {_vix_slope:+.3f}%/分钟</span>
             &nbsp;·&nbsp;
             <span style="color:{tc2}">TSLA {ta2} {_tsla_slope:+.3f}%/分钟</span><br>
-            <span style="color:#5a5c78">VIX 方向一致率={_vix_r2:.0%}（{_dir_count}/{_check_n}根同向）</span>
+            <span style="color:#5a5c78">VIX R²={_vix_r2:.2f}（趋势线性度）</span>
           </div>
           <div style="font-family:'Space Mono',monospace;font-size:10px;color:#5a5c78;margin-top:2px">
             阈值：斜率±{vix_slope_thresh:.2f}%/分钟，R²≥{min_r2:.2f}
@@ -2263,519 +1235,8 @@ if r1m is not None:
                  })
 
 # ══════════════════════════════════════════════════════════
-# VIX 急升急跌面板 UI
+# 页脚
 # ══════════════════════════════════════════════════════════
-st.markdown('<div class="sec">⚡ VIX 1分钟急升急跌监控（独立信号）</div>',
-            unsafe_allow_html=True)
-
-if not spike_enabled:
-    st.markdown("""<div style="font-family:'Space Mono',monospace;font-size:11px;
-    color:#5a5c78;padding:14px;border:1px solid #1e1f35;border-radius:10px">
-    📵 急速脉冲检测已关闭，在侧边栏启用「VIX 1分钟急升急跌」</div>""",
-    unsafe_allow_html=True)
-else:
-    sp_col1, sp_col2 = st.columns([3, 2])
-
-    with sp_col1:
-        if spike_sig is not None:
-            s       = spike_sig
-            ac      = "#ff8c00" if s["direction"] == "up" else "#3df5b0"
-            ex_glow = f"box-shadow:0 0 18px {ac}55;" if s["is_extreme"] else ""
-            tg_icon = "📲 已推送" if (spike_tg_fired and spike_tg_fired[0]) else (
-                      f"❌ {spike_tg_fired[1]}" if spike_tg_fired else
-                      ("📡 监控中" if tg_enabled else "📵 未启用"))
-
-            st.markdown(f"""
-            <div class="alert-box {s['css']}" style="{ex_glow}padding:18px 20px">
-              <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
-                <span style="font-size:32px">{s['emoji']}</span>
-                <div>
-                  <div class="alert-badge {s['badge']}" style="font-size:13px">
-                    {s['label']}
-                  </div>
-                  <div style="font-family:'Space Mono',monospace;font-size:10px;
-                              color:#5a5c78;margin-top:4px">
-                    置信度：<b style="color:{ac}">{s['confidence']}</b>
-                    &nbsp;·&nbsp; 模式：{s['mode']}
-                  </div>
-                </div>
-              </div>
-
-              <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;
-                          font-family:'Space Mono',monospace;margin-bottom:12px">
-                <div style="background:rgba(0,0,0,.3);border-radius:8px;padding:8px 10px;text-align:center">
-                  <div style="font-size:9px;color:#5a5c78;margin-bottom:3px">最后1根</div>
-                  <div style="font-size:18px;font-weight:700;color:{ac}">{s['chg1']:+.2f}%</div>
-                </div>
-                <div style="background:rgba(0,0,0,.3);border-radius:8px;padding:8px 10px;text-align:center">
-                  <div style="font-size:9px;color:#5a5c78;margin-bottom:3px">2根累计</div>
-                  <div style="font-size:18px;font-weight:700;color:{ac}">{s['cumulative']:+.2f}%</div>
-                </div>
-                <div style="background:rgba(0,0,0,.3);border-radius:8px;padding:8px 10px;text-align:center">
-                  <div style="font-size:9px;color:#5a5c78;margin-bottom:3px">VIX 当前</div>
-                  <div style="font-size:18px;font-weight:700;color:#dde1f5">{s['vix_now']:.2f}</div>
-                </div>
-              </div>
-
-              <div style="background:rgba(0,0,0,.3);border-radius:8px;padding:8px 12px;
-                          font-size:11px;color:#5a5c78;margin-bottom:10px;line-height:1.7">
-                💥 {s['meaning']}
-              </div>
-
-              <div style="background:rgba(0,0,0,.25);border-radius:8px;padding:8px 12px;
-                          font-size:13px;color:{ac};font-weight:700">
-                {s['action']}
-              </div>
-
-              <div class="alert-time" style="margin-top:8px">{tg_icon} · {datetime.now(ET).strftime('%H:%M:%S ET')}</div>
-            </div>""", unsafe_allow_html=True)
-
-            if spike_tg_fired:
-                cl = "ok" if spike_tg_fired[0] else "err"
-                ic = "⚡ 急速信号已推送" if spike_tg_fired[0] else f"❌ {spike_tg_fired[1]}"
-                st.markdown(f'<div class="tg-status {cl}" style="margin-top:6px">{ic}</div>',
-                            unsafe_allow_html=True)
-        else:
-            # 正常状态：显示最近2根 VIX K线变化
-            if len(df1m) >= 3:
-                v     = df1m["VIX"].values.astype(float)
-                c1    = (v[-1] - v[-2]) / v[-2] * 100 if v[-2] != 0 else 0
-                c2    = (v[-2] - v[-3]) / v[-3] * 100 if v[-3] != 0 else 0
-                cum   = (v[-1] - v[-3]) / v[-3] * 100 if v[-3] != 0 else 0
-                col1  = "#ff3d6b" if c1 > 0 else "#3df5b0"
-                col2  = "#ff3d6b" if c2 > 0 else "#3df5b0"
-                colc  = "#ff3d6b" if cum > 0 else "#3df5b0"
-                st.markdown(f"""
-                <div class="kcard t" style="border-left:4px solid #3df5b0;padding:16px 18px">
-                  <div class="klabel">VIX 急速脉冲状态 · 实时监控中</div>
-                  <div style="font-size:18px;font-weight:700;color:#3df5b0;margin:6px 0 12px">
-                    ✅ 未触发（阈值 ±{spike_pct:.1f}%）
-                  </div>
-                  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;
-                              font-family:'Space Mono',monospace">
-                    <div style="background:#141525;border-radius:8px;padding:8px 10px;text-align:center">
-                      <div style="font-size:9px;color:#5a5c78;margin-bottom:3px">最后1根</div>
-                      <div style="font-size:17px;font-weight:700;color:{col1}">{c1:+.2f}%</div>
-                    </div>
-                    <div style="background:#141525;border-radius:8px;padding:8px 10px;text-align:center">
-                      <div style="font-size:9px;color:#5a5c78;margin-bottom:3px">前1根</div>
-                      <div style="font-size:17px;font-weight:700;color:{col2}">{c2:+.2f}%</div>
-                    </div>
-                    <div style="background:#141525;border-radius:8px;padding:8px 10px;text-align:center">
-                      <div style="font-size:9px;color:#5a5c78;margin-bottom:3px">2根累计</div>
-                      <div style="font-size:17px;font-weight:700;color:{colc}">{cum:+.2f}%</div>
-                    </div>
-                  </div>
-                  <div style="font-family:'Space Mono',monospace;font-size:10px;
-                              color:#5a5c78;margin-top:8px">
-                    VIX 当前：{v[-1]:.2f} · 单根触发：±{spike_pct:.1f}% · 极端：±{extreme_pct:.1f}%
-                  </div>
-                </div>""", unsafe_allow_html=True)
-
-        # Telegram 总状态
-        if tg_enabled and tg_token and tg_chat_id:
-            st.markdown('<div class="tg-status ok" style="margin-top:6px">📡 VIX 脉冲 Telegram 监控中</div>',
-                        unsafe_allow_html=True)
-        elif not tg_enabled:
-            st.markdown('<div class="tg-status off" style="margin-top:6px">📵 Telegram 已关闭</div>',
-                        unsafe_allow_html=True)
-
-    with sp_col2:
-        # 参数说明 + 历史
-        last_sp_up   = st.session_state.spike_alert_time.get("vix_spike_up")
-        last_sp_down = st.session_state.spike_alert_time.get("vix_spike_down")
-        up_str   = last_sp_up.strftime("%H:%M ET") if last_sp_up else "—"
-        down_str = last_sp_down.strftime("%H:%M ET") if last_sp_down else "—"
-        st.markdown(f"""
-        <div style="font-family:'Space Mono',monospace;font-size:10px;color:#5a5c78;
-                    background:#0e0f1a;border:1px solid #1e1f35;border-radius:10px;
-                    padding:14px 16px;line-height:2.1">
-          <b style="color:#dde1f5">触发条件</b><br>
-          ⬆️ 急升：单根 ≥ +{spike_pct:.1f}%<br>
-          ⬇️ 急跌：单根 ≤ -{spike_pct:.1f}%<br>
-          🔁 确认：2根累计 ≥ ±{confirm_pct:.1f}%（同向）<br>
-          ⚡ 极端：单根/累计 ≥ ±{extreme_pct:.1f}%<br>
-          🔕 冷却：{spike_cooldown} 分钟<br><br>
-          <b style="color:#dde1f5">上次推送</b><br>
-          ⬆️ 急升：{up_str}<br>
-          ⬇️ 急跌：{down_str}
-        </div>""", unsafe_allow_html=True)
-
-    # 历史记录
-    if st.session_state.spike_history:
-        with st.expander(f"📋 VIX 急速信号历史（共 {len(st.session_state.spike_history)} 条）",
-                         expanded=False):
-            for rec in st.session_state.spike_history:
-                sent_icon = "📲" if rec.get("sent") else "🔕"
-                ex_mark   = "⚡" if rec.get("is_extreme") else ""
-                ac2       = "#ff8c00" if "up" in rec["type"] else "#3df5b0"
-                st.markdown(f"""
-                <div class="alert-box {rec['css']}" style="padding:10px 14px;margin:4px 0">
-                  <div style="display:flex;justify-content:space-between;align-items:center">
-                    <span class="alert-badge {rec['badge']}" style="font-size:10px">
-                      {ex_mark}{rec['emoji']} {rec['label']}
-                    </span>
-                    <span class="alert-time">
-                      {sent_icon} {rec['time'].strftime('%m-%d %H:%M:%S ET')}
-                    </span>
-                  </div>
-                  <div style="font-family:'Space Mono',monospace;font-size:11px;
-                              color:#5a5c78;margin-top:4px;line-height:1.7">
-                    VIX={rec['vix_now']:.2f} · 1根 <span style="color:{ac2}">{rec['chg1']:+.2f}%</span>
-                    · 2根累计 <span style="color:{ac2}">{rec['cumulative']:+.2f}%</span>
-                  </div>
-                </div>""", unsafe_allow_html=True)
-
-# ══════════════════════════════════════════════════════════
-# 期权流面板 UI
-# ══════════════════════════════════════════════════════════
-st.markdown('<div class="sec">📊 期权流信号 — TSLA Put/Call 比率（独立信号）</div>',
-            unsafe_allow_html=True)
-
-if not pc_enabled:
-    st.markdown("""
-    <div style="font-family:'Space Mono',monospace;font-size:11px;color:#5a5c78;
-                padding:14px;border:1px solid #1e1f35;border-radius:10px">
-    📵 期权流监控已关闭，在侧边栏启用「期权流 Put/Call 监控」
-    </div>""", unsafe_allow_html=True)
-
-elif pc_data.get("error"):
-    st.markdown(f"""
-    <div style="background:#ff3d6b10;border:1px solid #ff3d6b55;border-radius:10px;
-                padding:14px;font-family:'Space Mono',monospace;font-size:11px;color:#ff3d6b">
-    ⚠ 期权数据获取失败：{pc_data['error']}<br>
-    <span style="color:#5a5c78">Yahoo Finance 期权链在非交易时段可能返回空数据，盘中效果最佳。</span>
-    </div>""", unsafe_allow_html=True)
-
-else:
-    rv       = pc_data.get("ratio_volume")
-    ro       = pc_data.get("ratio_oi")
-    nv       = pc_data.get("near_pc_vol")
-    no_      = pc_data.get("near_pc_oi")
-    pv       = pc_data.get("put_vol", 0)
-    cv       = pc_data.get("call_vol", 0)
-    poi      = pc_data.get("put_oi", 0)
-    coi      = pc_data.get("call_oi", 0)
-    skew     = pc_data.get("atm_skew")
-    near_exp = pc_data.get("near_expiry", "—")
-    by_exp   = pc_data.get("by_expiry", [])
-    css      = pc_interp.get("css", "neut")
-    emoji    = pc_interp.get("emoji", "⚪")
-    label    = pc_interp.get("label", "—")
-    action   = pc_interp.get("action", "—")
-    desc     = pc_interp.get("desc", "—")
-    strength = pc_interp.get("strength", 50)
-    ac       = {"bull": "#3df5b0", "bear": "#ff3d6b", "neut": "#7b7bff"}.get(css, "#7b7bff")
-
-    # ── 顶部指标行
-    pc1, pc2, pc3, pc4 = st.columns(4)
-
-    with pc1:
-        rv_str = f"{rv:.3f}" if rv else "—"
-        st.markdown(f"""
-        <div class="kcard {css}">
-          <div class="klabel">P/C 成交量比率（综合）</div>
-          <div class="kval {css}" style="font-size:28px">{rv_str}</div>
-          <div class="ksub">Put {pv:,} · Call {cv:,}</div>
-        </div>""", unsafe_allow_html=True)
-
-    with pc2:
-        ro_str = f"{ro:.3f}" if ro else "—"
-        st.markdown(f"""
-        <div class="kcard {css}">
-          <div class="klabel">P/C 未平仓量比率（综合）</div>
-          <div class="kval {css}" style="font-size:28px">{ro_str}</div>
-          <div class="ksub">Put OI {poi:,} · Call OI {coi:,}</div>
-        </div>""", unsafe_allow_html=True)
-
-    with pc3:
-        nv_str = f"{nv:.3f}" if nv else "—"
-        st.markdown(f"""
-        <div class="kcard {css}">
-          <div class="klabel">近月 P/C（{near_exp}）</div>
-          <div class="kval {css}" style="font-size:28px">{nv_str}</div>
-          <div class="ksub">近月最敏感，流动性最好</div>
-        </div>""", unsafe_allow_html=True)
-
-    with pc4:
-        skew_str   = f"{skew:+.1f}%" if skew is not None else "—"
-        skew_color = "#ff3d6b" if skew and skew > 3 else ("#3df5b0" if skew and skew < -2 else "#7b7bff")
-        skew_label = "Put 溢价（偏空）" if skew and skew > 3 else ("Call 溢价（偏多）" if skew and skew < -2 else "ATM 偏斜中性")
-        st.markdown(f"""
-        <div class="kcard p">
-          <div class="klabel">ATM 波动率偏斜（Put IV − Call IV）</div>
-          <div class="kval p" style="font-size:26px;color:{skew_color}">{skew_str}</div>
-          <div class="ksub">{skew_label}</div>
-        </div>""", unsafe_allow_html=True)
-
-    # ── 信号解读 + 各到期日明细
-    sig_col, detail_col = st.columns([3, 2])
-
-    with sig_col:
-        # 信号强度条
-        bar_color = ac
-        st.markdown(f"""
-        <div class="pc-card {css}">
-          <div class="klabel" style="margin-bottom:8px">期权流信号研判</div>
-          <div class="pc-signal {css}">{emoji} {label}</div>
-          <div style="margin:10px 0 4px;font-family:'Space Mono',monospace;
-                      font-size:10px;color:#5a5c78">信号强度</div>
-          <div class="pc-bar-wrap">
-            <div class="pc-bar-fill" style="width:{strength}%;
-                 background:linear-gradient(90deg,{bar_color}88,{bar_color})"></div>
-          </div>
-          <div style="font-family:'Space Mono',monospace;font-size:10px;
-                      color:{bar_color};margin-bottom:10px">{strength}/100</div>
-          <div style="background:rgba(0,0,0,.25);border-radius:8px;padding:10px 12px;
-                      font-size:13px;color:{ac};font-weight:700;margin-bottom:10px">
-            {action}
-          </div>
-          <div style="font-family:'Space Mono',monospace;font-size:11px;
-                      color:#5a5c78;line-height:1.8">{desc}</div>
-        </div>""", unsafe_allow_html=True)
-
-        # Telegram 状态
-        if pc_interp.get("tg_worthy"):
-            if pc_tg_fired:
-                tg_ic = "✅ 期权流 Telegram 已推送" if pc_tg_fired[0] else f"❌ 推送失败：{pc_tg_fired[1]}"
-                tg_cl = "ok" if pc_tg_fired[0] else "err"
-            else:
-                last_pc = st.session_state.pc_alert_time
-                if last_pc:
-                    mins = int((datetime.now(ET) - last_pc).total_seconds() / 60)
-                    tg_ic = f"⏱ 冷却中（{mins}/{pc_cooldown} 分钟）"
-                else:
-                    tg_ic = "📵 Telegram 未启用" if not tg_enabled else "⏱ 冷却中"
-                tg_cl = "off"
-            st.markdown(f'<div class="tg-status {tg_cl}" style="margin-top:6px">📊 {tg_ic}</div>',
-                        unsafe_allow_html=True)
-
-    with detail_col:
-        # 各到期日明细
-        st.markdown("""
-        <div style="font-family:'Space Mono',monospace;font-size:10px;
-                    letter-spacing:1px;color:#5a5c78;margin-bottom:8px">
-        各到期日 P/C 明细
-        </div>""", unsafe_allow_html=True)
-
-        if by_exp:
-            for row in by_exp:
-                exp     = row["expiry"]
-                pc_v    = row.get("pc_vol")
-                pc_o    = row.get("pc_oi")
-                rv_disp = f"{pc_v:.2f}" if pc_v else "—"
-                ro_disp = f"{pc_o:.2f}" if pc_o else "—"
-                # 颜色：<0.7 绿，>1.0 红，其他蓝
-                v_col = "#3df5b0" if pc_v and pc_v < 0.7 else ("#ff3d6b" if pc_v and pc_v > 1.0 else "#7b7bff")
-                pct_call = int(row["call_vol"] / (row["call_vol"] + row["put_vol"]) * 100) if (row["call_vol"] + row["put_vol"]) > 0 else 50
-                st.markdown(f"""
-                <div style="background:#141525;border:1px solid #1e1f35;border-radius:8px;
-                            padding:10px 12px;margin-bottom:6px">
-                  <div style="display:flex;justify-content:space-between;
-                              font-family:'Space Mono',monospace;font-size:10px">
-                    <span style="color:#dde1f5;font-weight:700">{exp}</span>
-                    <span style="color:{v_col}">P/C={rv_disp}</span>
-                  </div>
-                  <div style="margin:6px 0 3px;height:6px;background:#0e0f1a;border-radius:3px;overflow:hidden">
-                    <div style="height:100%;width:{pct_call}%;
-                                background:linear-gradient(90deg,#3df5b0,#00c896);border-radius:3px"></div>
-                  </div>
-                  <div style="font-family:'Space Mono',monospace;font-size:9px;color:#5a5c78;
-                              display:flex;justify-content:space-between">
-                    <span>Call {row['call_vol']:,}</span>
-                    <span>Put {row['put_vol']:,}</span>
-                  </div>
-                </div>""", unsafe_allow_html=True)
-        else:
-            st.markdown('<div style="color:#5a5c78;font-size:11px">暂无到期日数据</div>',
-                        unsafe_allow_html=True)
-
-    # ── P/C 比率参考区间说明
-    st.markdown(f"""
-    <div style="font-family:'Space Mono',monospace;font-size:10px;color:#5a5c78;
-                background:#0e0f1a;border:1px solid #1e1f35;border-radius:8px;
-                padding:10px 14px;margin-top:8px;line-height:2">
-      <b style="color:#dde1f5">P/C 比率参考区间（TSLA 经验值）</b> &nbsp;·&nbsp;
-      当前触发阈值：看涨 &lt; {pc_bull_thresh:.2f}，看空 &gt; {pc_bear_thresh:.2f}<br>
-      &lt;0.4 极度乐观（逆向偏空）&nbsp;·&nbsp;
-      0.4–0.6 偏多&nbsp;·&nbsp;
-      0.6–0.85 中性偏多&nbsp;·&nbsp;
-      0.85–1.1 中性&nbsp;·&nbsp;
-      1.1–1.5 偏空&nbsp;·&nbsp;
-      &gt;1.5 极度悲观（逆向偏多）&nbsp;·&nbsp;
-      更新间隔：约 2 分钟 · 冷却：{pc_cooldown} 分钟
-    </div>""", unsafe_allow_html=True)
-
-    # ── 期权流历史
-    if st.session_state.pc_history:
-        with st.expander(f"📋 期权流信号历史（共 {len(st.session_state.pc_history)} 条）",
-                         expanded=False):
-            for rec in st.session_state.pc_history:
-                sent_icon = "📲" if rec.get("sent") else "🔕"
-                ratio_str = f"{rec['ratio']:.3f}" if rec.get("ratio") else "—"
-                clr = {"bull": "#3df5b0", "bear": "#ff3d6b", "neut": "#7b7bff"}.get(rec.get("css"), "#7b7bff")
-                st.markdown(f"""
-                <div class="pc-card {rec.get('css','neut')}" style="padding:10px 14px;margin:4px 0">
-                  <div style="display:flex;justify-content:space-between;align-items:center">
-                    <span style="color:{clr};font-weight:700;font-size:12px">
-                      {rec.get('emoji','')} {rec['label']}
-                    </span>
-                    <span style="font-family:'Space Mono',monospace;font-size:9px;color:#5a5c78">
-                      {sent_icon} P/C={ratio_str} · {rec['time'].strftime('%m-%d %H:%M ET')}
-                    </span>
-                  </div>
-                  <div style="font-size:11px;color:#5a5c78;margin-top:4px">{rec['desc']}</div>
-                </div>""", unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════════════════
-# 多因子策略胜率面板 UI
-# ══════════════════════════════════════════════════════════
-st.markdown('<div class="sec">🎯 多因子策略胜率信号（独立信号）</div>', unsafe_allow_html=True)
-
-if not strat_enabled:
-    st.markdown("""<div style="font-family:'Space Mono',monospace;font-size:11px;
-    color:#5a5c78;padding:14px;border:1px solid #1e1f35;border-radius:10px">
-    📵 策略胜率引擎已关闭，在侧边栏启用「多因子策略胜率」</div>""", unsafe_allow_html=True)
-
-elif strat_data.get("error"):
-    st.warning(f"⚠ 策略数据获取失败：{strat_data['error']}")
-
-elif strat_wr:
-    wr      = strat_wr
-    factors = strat_factors
-    price   = strat_data.get("tsla_price")
-    color   = wr["color"]
-    winrate = wr["winrate"]
-    pct_bar = min(100, int((winrate - 48) / (76 - 48) * 100))
-
-    main_col, factor_col = st.columns([2, 3])
-
-    with main_col:
-        score_bg     = f"{color}22"
-        score_border = f"{color}66"
-        st.markdown(f"""
-        <div class="strat-card" style="text-align:center;border-color:{score_border};
-                                        background:{score_bg}">
-          <div style="font-family:'Space Mono',monospace;font-size:10px;letter-spacing:2px;
-                      color:#5a5c78;margin-bottom:12px">策略胜率估算</div>
-          <div style="font-family:'Space Mono',monospace;font-size:52px;font-weight:700;
-                      color:{color};line-height:1">{winrate:.1f}<span style="font-size:22px">%</span></div>
-          <div style="font-family:'Space Mono',monospace;font-size:12px;
-                      color:{color};margin:8px 0 14px">{wr['tier']} · {len(wr['active_factors'])}/5 因子满足</div>
-          <div class="win-meter">
-            <div class="win-fill" style="width:{pct_bar}%;
-                 background:linear-gradient(90deg,{color}88,{color})"></div>
-          </div>
-          <div style="font-family:'Space Mono',monospace;font-size:12px;
-                      font-weight:700;color:{color};margin-top:10px">{wr['signal']}</div>
-        </div>""", unsafe_allow_html=True)
-
-        vwap_f  = factors.get("vwap_reclaim", {})
-        gamma_f = factors.get("gamma_support", {})
-        vwap_v  = vwap_f.get("vwap")
-        g_sup   = gamma_f.get("support")
-        g_res   = gamma_f.get("resist")
-        if price or vwap_v or g_sup:
-            st.markdown(f"""
-            <div style="font-family:'Space Mono',monospace;font-size:11px;
-                        background:#0e0f1a;border:1px solid #1e1f35;border-radius:10px;
-                        padding:12px 14px;margin-top:10px;line-height:2.2">
-              <b style="color:#dde1f5">关键价位参考</b><br>
-              {"💵 TSLA $" + f"{price:.2f}" if price else ""}
-              {"&nbsp;·&nbsp;📊 VWAP $" + f"{vwap_v:.2f}" if vwap_v else ""}<br>
-              {"🧲 Gamma 支撑 $" + f"{g_sup:.1f}" if g_sup else ""}
-              {"&nbsp;·&nbsp;🚧 阻力 $" + f"{g_res:.1f}" if g_res else ""}
-            </div>""", unsafe_allow_html=True)
-
-        if strat_tg_fired:
-            tg_s_ic = "✅ 策略信号已推送" if strat_tg_fired[0] else f"❌ {strat_tg_fired[1]}"
-            tg_s_cl = "ok" if strat_tg_fired[0] else "err"
-        elif winrate >= strat_min_wr:
-            last_s = st.session_state.strat_alert_time
-            if last_s:
-                m = int((datetime.now(ET) - last_s).total_seconds() / 60)
-                tg_s_ic, tg_s_cl = f"⏱ 冷却中（{m}/{strat_cooldown}分钟）", "off"
-            else:
-                tg_s_ic = "📵 Telegram 未启用" if not tg_enabled else "📡 监控中"
-                tg_s_cl = "ok" if tg_enabled else "off"
-        else:
-            tg_s_ic = f"⏸ 胜率 {winrate:.1f}% < 阈值 {strat_min_wr}%"
-            tg_s_cl = "off"
-        st.markdown(f'<div class="tg-status {tg_s_cl}" style="margin-top:6px">🎯 {tg_s_ic}</div>',
-                    unsafe_allow_html=True)
-
-    with factor_col:
-        st.markdown("""<div style="font-family:'Space Mono',monospace;font-size:10px;
-        letter-spacing:1px;color:#5a5c78;margin-bottom:10px">五大因子评估</div>""",
-                    unsafe_allow_html=True)
-
-        factor_defs = [
-            ("vix_down",      "📉", "VIX ↓",          "核心因子，权重×2"),
-            ("spx_up",        "📈", "SPX ↑",           "核心因子，权重×2"),
-            ("tsla_rs",       "💪", "TSLA 相对强度 ↑",  "核心因子，权重×2"),
-            ("gamma_support", "🧲", "Gamma 支撑",       "加强因子，权重×1.5"),
-            ("vwap_reclaim",  "📊", "VWAP 夺回",        "加强因子，权重×1.5"),
-        ]
-        for key, icon, name, weight_note in factor_defs:
-            f    = factors.get(key, {})
-            act  = f.get("active")
-            if key == "gamma_support":
-                on_s    = f.get("on_support")
-                row_cls = "on" if on_s else ("off" if on_s is False else "na")
-                mark    = "✅" if on_s else ("⚠️" if act is True else ("—" if act is None else "❌"))
-            else:
-                row_cls = "on" if act is True else ("off" if act is False else "na")
-                mark    = "✅" if act is True else ("—" if act is None else "❌")
-            val_cls = "on" if row_cls == "on" else ("off" if row_cls == "off" else "")
-
-            st.markdown(f"""
-            <div class="factor-row {row_cls}">
-              <span class="f-icon">{mark}</span>
-              <span class="f-icon">{icon}</span>
-              <span class="f-name">
-                <b>{name}</b>
-                <span style="color:#5a5c78;font-size:9px"> · {weight_note}</span><br>
-                <span style="color:#5a5c78;font-size:10px">{f.get('detail','—')}</span>
-              </span>
-              <span class="f-val {val_cls}">{f.get('value','—')}</span>
-            </div>""", unsafe_allow_html=True)
-
-        st.markdown(f"""
-        <div style="font-family:'Space Mono',monospace;font-size:10px;color:#5a5c78;
-                    background:#0e0f1a;border:1px solid #1e1f35;border-radius:8px;
-                    padding:10px 14px;margin-top:10px;line-height:1.9">
-          <b style="color:#dde1f5">胜率参考（历史统计锚点）</b><br>
-          VIX↓ + SPX↑ + RS↑ → 约 63–68%&nbsp;·&nbsp;
-          加 Gamma 支撑 → +3–4%&nbsp;·&nbsp;
-          全部5因子 → 70%+<br>
-          当前因子得分：<b style="color:{color}">{wr['score']:.1f} / {wr['max_score']:.1f}</b>
-          &nbsp;·&nbsp;触发阈值：{strat_min_wr}%&nbsp;·&nbsp;冷却：{strat_cooldown} 分钟
-        </div>""", unsafe_allow_html=True)
-
-    if st.session_state.strat_history:
-        with st.expander(f"📋 策略信号历史（共 {len(st.session_state.strat_history)} 条）",
-                         expanded=False):
-            for rec in st.session_state.strat_history:
-                sent_icon = "📲" if rec.get("sent") else "🔕"
-                clr = rec.get("color", "#7b7bff")
-                st.markdown(f"""
-                <div style="background:#0e0f1a;border:1px solid #1e1f35;border-radius:8px;
-                            padding:10px 14px;margin:4px 0">
-                  <div style="display:flex;justify-content:space-between;align-items:center">
-                    <span style="color:{clr};font-weight:700;font-size:12px;
-                                 font-family:'Space Mono',monospace">{rec['signal']}</span>
-                    <span style="font-family:'Space Mono',monospace;font-size:9px;color:#5a5c78">
-                      {sent_icon} {rec['n_active']}/5因子 · {rec['time'].strftime('%m-%d %H:%M ET')}
-                    </span>
-                  </div>
-                  <div style="font-family:'Space Mono',monospace;font-size:10px;
-                              color:#5a5c78;margin-top:4px">
-                    胜率 {rec['winrate']:.1f}% · {rec['tier']}
-                  </div>
-                </div>""", unsafe_allow_html=True)
-
-
 refresh_info = "下次刷新：30 秒后" if auto_refresh else "自动刷新已关闭"
 st.markdown(f"""
 <div style="font-family:'Space Mono',monospace;font-size:10px;color:#22233a;

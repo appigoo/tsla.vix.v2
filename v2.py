@@ -314,25 +314,63 @@ def get_market_session():
     return "post", "盘后交易", ts
 
 
-@st.cache_data(ttl=25)   # 略短于刷新间隔，确保每次都拿新数据
+@st.cache_data(ttl=25)
 def fetch_1min(days_back: int = 5, _cache_bust: int = 0):
     """
-    1 分钟 K 线，含盘前盘后（prepost=True）
+    1 分钟 K 线，含盘前盘后。
 
-    关键修复：
-    - 用 start/end 代替 period，绕过 yfinance 内部的 period 缓存
-    - _cache_bust 参数每次刷新递增，强制 Streamlit 视为新调用
+    双轨拉取策略，彻底解决延迟问题：
+    ① Ticker.history(period="1d") — 专门拉今天最新数据
+       yfinance 的 history() 走不同的内部路径，延迟最低（通常 <2分钟）
+    ② download(start=...) — 拉过去 N 天的上下文数据
+    ③ 合并去重，取最新时间戳，确保图表最右侧是真正最新的K线
     """
     ET_tz = pytz.timezone("America/New_York")
     now   = datetime.now(ET_tz)
-    # 往前多取1天确保数据完整，end 设为明天避免当天数据被截断
     start = (now - dt.timedelta(days=days_back + 1)).strftime("%Y-%m-%d")
     end   = (now + dt.timedelta(days=1)).strftime("%Y-%m-%d")
 
-    tsla = yf.download("TSLA", start=start, end=end, interval="1m",
-                        prepost=True, progress=False, auto_adjust=True)
-    vix  = yf.download("^VIX",  start=start, end=end, interval="1m",
-                        prepost=True, progress=False, auto_adjust=True)
+    def _merge(ctx, today):
+        """合并历史上下文 + 今日最新，去重保留最新值"""
+        if today is None or today.empty:
+            return ctx
+        if ctx is None or ctx.empty:
+            return today
+        # 统一时区
+        if ctx.index.tz is None:
+            ctx.index = ctx.index.tz_localize("UTC")
+        if today.index.tz is None:
+            today.index = today.index.tz_localize("UTC")
+        ctx   = ctx.tz_convert("America/New_York")
+        today = today.tz_convert("America/New_York")
+        # 合并：用 today 覆盖 ctx 中相同时间戳的行，并追加 today 中更新的行
+        combined = pd.concat([ctx, today])
+        combined = combined[~combined.index.duplicated(keep="last")]
+        return combined.sort_index()
+
+    # ── ① 今日最新（history 路径，延迟最低）
+    try:
+        tsla_today = yf.Ticker("TSLA").history(period="1d", interval="1m",
+                                                prepost=True, auto_adjust=True)
+        vix_today  = yf.Ticker("^VIX").history(period="1d",  interval="1m",
+                                                prepost=True, auto_adjust=True)
+    except Exception:
+        tsla_today = None
+        vix_today  = None
+
+    # ── ② 历史上下文（download 路径）
+    try:
+        tsla_ctx = yf.download("TSLA", start=start, end=end, interval="1m",
+                               prepost=True, progress=False, auto_adjust=True)
+        vix_ctx  = yf.download("^VIX",  start=start, end=end, interval="1m",
+                               prepost=True, progress=False, auto_adjust=True)
+    except Exception:
+        tsla_ctx = tsla_today
+        vix_ctx  = vix_today
+
+    # ── ③ 合并
+    tsla = _merge(tsla_ctx, tsla_today)
+    vix  = _merge(vix_ctx,  vix_today)
     return tsla, vix
 
 

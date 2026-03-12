@@ -1165,95 +1165,138 @@ def detect_spot(
 
 def detect_trend(
     df: pd.DataFrame,
-    trend_window: int = 10,
+    trend_window: int = 10,       # 用户设定（现在仅作 EMA span 参考）
     vix_slope_thresh: float = 0.05,
     tsla_slope_thresh: float = 0.02,
-    min_r2: float = 0.5,
+    min_r2: float = 0.5,          # 保留参数名兼容侧边栏，但不再用 R² 作主要门槛
 ) -> dict | None:
     """
-    ② 线性回归趋势检测（高置信度确认）
-    逻辑：对最近 trend_window 根 K 线做线性回归，检测持续方向性趋势
-    优点：过滤锯齿噪音，只响应真正的趋势性移动（R² 门槛）
-    缺点：反应稍慢，需要趋势持续一段时间才触发
+    ② EMA 斜率趋势确认（快速高置信版）
+
+    原线性回归需要 10 根 K 线才稳定，本版改用：
+      · EMA(3) 斜率：3 根指数加权均线，对最新数据权重更高，响应快 3–5 分钟
+      · 连续方向计数：最近 N 根 K 线中有几根与趋势同向（替代 R² 门槛）
+      · 双重确认：EMA 斜率 + 连续方向数同时满足才触发
+
+    优点：3–4 分钟内即可确认趋势，且噪音容忍度可调
     """
-    if len(df) < trend_window + 2:
+    # 最少需要 ema_span*2 根数据才稳定
+    ema_span = max(3, min(trend_window // 2, 5))   # 3–5，随窗口自适应
+    min_bars = ema_span * 2 + 2
+    if len(df) < min_bars:
         return None
 
-    recent = df.iloc[-trend_window:].copy()
-    vix_slope,  vix_r2,  vix_total  = calc_trend(recent["VIX"])
-    tsla_slope, tsla_r2, tsla_total = calc_trend(recent["TSLA"])
+    # ── EMA 斜率计算
+    vix_ema   = df["VIX"].ewm(span=ema_span, adjust=False).mean()
+    tsla_ema  = df["TSLA"].ewm(span=ema_span, adjust=False).mean()
+
+    # 最后3根 EMA 斜率（%/根）
+    def _ema_slope(ema_s):
+        vals = ema_s.iloc[-3:].values.astype(float)
+        if vals[0] == 0:
+            return 0.0
+        # 平均斜率（最后两段的均值）
+        s1 = (vals[1] - vals[0]) / vals[0] * 100
+        s2 = (vals[2] - vals[1]) / vals[1] * 100
+        return (s1 + s2) / 2
+
+    vix_ema_slope  = _ema_slope(vix_ema)
+    tsla_ema_slope = _ema_slope(tsla_ema)
+
+    # ── 连续方向计数（最近 N 根原始 K 线有几根同向）
+    check_n = min(trend_window, len(df) - 1, 6)   # 最多检查 6 根
+    vix_vals  = df["VIX"].iloc[-(check_n+1):].values.astype(float)
+    tsla_vals = df["TSLA"].iloc[-(check_n+1):].values.astype(float)
+
+    vix_up_count  = sum(1 for i in range(1, len(vix_vals))  if vix_vals[i]  > vix_vals[i-1])
+    vix_dn_count  = sum(1 for i in range(1, len(vix_vals))  if vix_vals[i]  < vix_vals[i-1])
+    tsla_up_count = sum(1 for i in range(1, len(tsla_vals)) if tsla_vals[i] > tsla_vals[i-1])
+    tsla_dn_count = sum(1 for i in range(1, len(tsla_vals)) if tsla_vals[i] < tsla_vals[i-1])
+
+    # 方向一致性：60% 以上同向视为趋势（比 R²≥0.5 等效但响应更快）
+    min_count = max(2, int(check_n * 0.6))
 
     now_ts   = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
-    vix_now  = float(recent["VIX"].iloc[-1])
-    tsla_now = float(recent["TSLA"].iloc[-1])
-    strength = "强" if vix_r2 >= 0.75 else "中等"
+    vix_now  = float(df["VIX"].iloc[-1])
+    tsla_now = float(df["TSLA"].iloc[-1])
+    vix_total  = (vix_now - float(df["VIX"].iloc[-check_n])) / float(df["VIX"].iloc[-check_n]) * 100
+    tsla_total = (tsla_now - float(df["TSLA"].iloc[-check_n])) / float(df["TSLA"].iloc[-check_n]) * 100
 
-    # VIX 持续上升趋势，TSLA 未跟跌
-    if (vix_slope  >=  vix_slope_thresh and
-        vix_r2     >=  min_r2           and
-        tsla_slope >= -tsla_slope_thresh):
+    # 置信度标签（用方向计数替代 R²）
+    def _conf(count, total):
+        ratio = count / total if total > 0 else 0
+        return "高" if ratio >= 0.8 else "中等"
+
+    # ── 🔴 VIX EMA 上升 + 方向确认 + TSLA 未跟跌
+    if (vix_ema_slope  >= vix_slope_thresh   and   # EMA 斜率向上
+        vix_up_count   >= min_count          and   # 方向一致性（快速 R² 替代）
+        tsla_ema_slope >= -tsla_slope_thresh):      # TSLA EMA 未同步下行
+
+        conf = _conf(vix_up_count, check_n)
         return {
             "type":       "trend_vix_up",
             "mode":       "trend",
-            "label":      "🔴 趋势确认：VIX持续升 TSLA未跌",
+            "label":      "🔴 趋势确认：VIX升势 TSLA未跌",
             "badge":      "divup",
             "css":        "div-up",
             "emoji":      "🔴",
-            "vix_slope":  vix_slope,
-            "tsla_slope": tsla_slope,
-            "vix_r2":     vix_r2,
+            "vix_slope":  vix_ema_slope,
+            "tsla_slope": tsla_ema_slope,
+            "vix_r2":     round(vix_up_count / check_n, 2),   # 用方向一致率代替 R²
             "action":     "⚠️ 趋势确认：TSLA 补跌概率高（减仓/做空）",
             "msg": (
-                f"🔴 <b>[趋势确认] VIX 持续上升，TSLA 尚未跟跌</b>\n\n"
-                f"📈 VIX 趋势（过去 {trend_window} 分钟）\n"
-                f"   斜率：{vix_slope:+.3f}%/分钟  |  R²={vix_r2:.2f}（{strength}趋势）\n"
+                f"🔴 <b>[趋势确认·EMA] VIX 升势持续，TSLA 尚未跟跌</b>\n\n"
+                f"📈 VIX EMA({ema_span}) 斜率：<b>{vix_ema_slope:+.3f}%/根</b>\n"
+                f"   {check_n} 根中 <b>{vix_up_count}</b> 根上升（方向一致率 {vix_up_count/check_n:.0%}，{conf}置信）\n"
                 f"   累计涨幅：{vix_total:+.2f}%  |  当前：{vix_now:.2f}\n\n"
-                f"😴 TSLA 同期走势\n"
-                f"   斜率：{tsla_slope:+.3f}%/分钟  |  当前：${tsla_now:.2f}\n\n"
-                f"📌 持续性恐慌趋势已形成（R²={vix_r2:.2f}），置信度高。\n"
-                f"   TSLA 补跌概率显著，非短期脉冲。\n\n"
+                f"😴 TSLA EMA 斜率：<b>{tsla_ema_slope:+.3f}%/根</b>（未同步下跌）\n"
+                f"   当前：${tsla_now:.2f}\n\n"
+                f"📌 恐慌升势已形成（{conf}置信），TSLA 大概率跟随补跌。\n"
                 f"💡 建议减仓或做空，并设置止损位。\n\n"
                 f"🕐 {now_ts}"
             ),
             "desc_html": (
-                f"<b style='color:#ff3d6b'>[趋势]</b> "
-                f"VIX 斜率 <b>{vix_slope:+.3f}%/分钟</b>（R²={vix_r2:.2f}，{strength}），"
-                f"TSLA 斜率仅 <b>{tsla_slope:+.3f}%/分钟</b><br>"
+                f"<b style='color:#ff3d6b'>[趋势·EMA{ema_span}]</b> "
+                f"VIX 斜率 <b>{vix_ema_slope:+.3f}%/根</b>，"
+                f"{check_n}根中 <b>{vix_up_count}</b> 根同向（{conf}置信），"
+                f"TSLA 未跟跌<br>"
                 f"<span style='color:#ff8c00'>⚠ 趋势确认 · TSLA 补跌概率高 · 减仓/做空</span>"
             ),
         }
 
-    # VIX 持续下降趋势，TSLA 未跟涨
-    if (vix_slope  <= -vix_slope_thresh and
-        vix_r2     >=  min_r2           and
-        tsla_slope <=  tsla_slope_thresh):
+    # ── 🟢 VIX EMA 下降 + 方向确认 + TSLA 未跟涨
+    if (vix_ema_slope  <= -vix_slope_thresh  and
+        vix_dn_count   >= min_count          and
+        tsla_ema_slope <=  tsla_slope_thresh):
+
+        conf = _conf(vix_dn_count, check_n)
         return {
             "type":       "trend_vix_down",
             "mode":       "trend",
-            "label":      "🟢 趋势确认：VIX持续降 TSLA未涨",
+            "label":      "🟢 趋势确认：VIX降势 TSLA未涨",
             "badge":      "divdn",
             "css":        "div-down",
             "emoji":      "🟢",
-            "vix_slope":  vix_slope,
-            "tsla_slope": tsla_slope,
-            "vix_r2":     vix_r2,
+            "vix_slope":  vix_ema_slope,
+            "tsla_slope": tsla_ema_slope,
+            "vix_r2":     round(vix_dn_count / check_n, 2),
             "action":     "✅ 趋势确认：TSLA 补涨概率高（做多/加仓）",
             "msg": (
-                f"🟢 <b>[趋势确认] VIX 持续下降，TSLA 尚未跟涨</b>\n\n"
-                f"📉 VIX 趋势（过去 {trend_window} 分钟）\n"
-                f"   斜率：{vix_slope:+.3f}%/分钟  |  R²={vix_r2:.2f}（{strength}趋势）\n"
+                f"🟢 <b>[趋势确认·EMA] VIX 降势持续，TSLA 尚未跟涨</b>\n\n"
+                f"📉 VIX EMA({ema_span}) 斜率：<b>{vix_ema_slope:+.3f}%/根</b>\n"
+                f"   {check_n} 根中 <b>{vix_dn_count}</b> 根下降（方向一致率 {vix_dn_count/check_n:.0%}，{conf}置信）\n"
                 f"   累计跌幅：{vix_total:+.2f}%  |  当前：{vix_now:.2f}\n\n"
-                f"😴 TSLA 同期走势\n"
-                f"   斜率：{tsla_slope:+.3f}%/分钟  |  当前：${tsla_now:.2f}\n\n"
-                f"📌 持续性恐慌消退趋势已形成（R²={vix_r2:.2f}），置信度高。\n"
-                f"   TSLA 补涨概率显著，非短期脉冲反弹。\n\n"
+                f"😴 TSLA EMA 斜率：<b>{tsla_ema_slope:+.3f}%/根</b>（未同步上涨）\n"
+                f"   当前：${tsla_now:.2f}\n\n"
+                f"📌 恐慌消退趋势已形成（{conf}置信），TSLA 大概率跟随补涨。\n"
                 f"💡 建议做多或加仓，关注上行动能确认。\n\n"
                 f"🕐 {now_ts}"
             ),
             "desc_html": (
-                f"<b style='color:#3df5b0'>[趋势]</b> "
-                f"VIX 斜率 <b>{vix_slope:+.3f}%/分钟</b>（R²={vix_r2:.2f}，{strength}），"
-                f"TSLA 斜率仅 <b>{tsla_slope:+.3f}%/分钟</b><br>"
+                f"<b style='color:#3df5b0'>[趋势·EMA{ema_span}]</b> "
+                f"VIX 斜率 <b>{vix_ema_slope:+.3f}%/根</b>，"
+                f"{check_n}根中 <b>{vix_dn_count}</b> 根同向（{conf}置信），"
+                f"TSLA 未跟涨<br>"
                 f"<span style='color:#3df5b0'>✅ 趋势确认 · TSLA 补涨概率高 · 做多/加仓</span>"
             ),
         }
@@ -1363,8 +1406,8 @@ with st.sidebar:
 
     # ── 趋势回归检测参数
     st.markdown("**② 线性趋势（高置信确认）**")
-    trend_window      = st.slider("趋势观察窗口（分钟）", 5, 30, 10,
-                                  help="对最近 N 分钟做线性回归，过滤噪音，只响应持续趋势")
+    trend_window      = st.slider("趋势观察窗口（分钟）", 4, 20, 6,
+                                  help="EMA span 自动取窗口的一半（3–5），检查最近 min(窗口,6) 根 K 线方向一致性")
     vix_slope_thresh  = st.slider("VIX 趋势斜率阈值（%/分钟）", 0.01, 0.20, 0.05, step=0.01,
                                   help="VIX 每分钟需涨/跌超过此值才视为有效趋势")
     tsla_slope_thresh = st.slider("TSLA 斜率容忍度（%/分钟）", 0.01, 0.10, 0.02, step=0.01,
@@ -1792,9 +1835,22 @@ st.markdown('<div class="sec">🚨 双引擎预警监控（单点快速 + 趋势
 
 # 实时趋势数值（用于正常状态显示）
 _r_spot  = df1m.iloc[-spot_window:] if len(df1m) >= spot_window else df1m
-_r_trend = df1m.iloc[-trend_window:] if len(df1m) >= trend_window else df1m
-_vix_slope,  _vix_r2,  _ = calc_trend(_r_trend["VIX"])
-_tsla_slope, _tsla_r2, _ = calc_trend(_r_trend["TSLA"])
+_r_trend = df1m.iloc[-(trend_window*2+2):] if len(df1m) >= trend_window*2+2 else df1m
+_ema_span = max(3, min(trend_window // 2, 5))
+_vix_ema  = _r_trend["VIX"].ewm(span=_ema_span, adjust=False).mean()
+_tsla_ema = _r_trend["TSLA"].ewm(span=_ema_span, adjust=False).mean()
+def _quick_slope(s):
+    v = s.iloc[-3:].values.astype(float)
+    if len(v) < 3 or v[0] == 0: return 0.0
+    return ((v[1]-v[0])/v[0]*100 + (v[2]-v[1])/v[1]*100) / 2
+_vix_slope  = _quick_slope(_vix_ema)
+_tsla_slope = _quick_slope(_tsla_ema)
+_check_n = min(trend_window, len(_r_trend)-1, 6)
+_vix_vals = _r_trend["VIX"].iloc[-(_check_n+1):].values.astype(float)
+_vix_up_c = sum(1 for i in range(1, len(_vix_vals)) if _vix_vals[i] > _vix_vals[i-1])
+_vix_dn_c = sum(1 for i in range(1, len(_vix_vals)) if _vix_vals[i] < _vix_vals[i-1])
+_dir_count = max(_vix_up_c, _vix_dn_c)
+_vix_r2 = round(_dir_count / _check_n, 2) if _check_n > 0 else 0.0
 
 # 单点窗口涨跌幅
 if len(df1m) >= spot_window + 1:
@@ -1881,7 +1937,7 @@ with panel_trend:
             <span style="color:{vc2}">VIX {va2} {_vix_slope:+.3f}%/分钟</span>
             &nbsp;·&nbsp;
             <span style="color:{tc2}">TSLA {ta2} {_tsla_slope:+.3f}%/分钟</span><br>
-            <span style="color:#5a5c78">VIX R²={_vix_r2:.2f}（趋势线性度）</span>
+            <span style="color:#5a5c78">VIX 方向一致率={_vix_r2:.0%}（{_dir_count}/{_check_n}根同向）</span>
           </div>
           <div style="font-family:'Space Mono',monospace;font-size:10px;color:#5a5c78;margin-top:2px">
             阈值：斜率±{vix_slope_thresh:.2f}%/分钟，R²≥{min_r2:.2f}

@@ -289,7 +289,7 @@ html, body, [class*="css"] {
 # 工具函数
 # ══════════════════════════════════════════════════════════
 
-ET = pytz.timezone("America/New_York")
+ET = pytz.timezone("Europe/London")
 
 # session_state 必须在任何使用之前初始化
 if "refresh_count" not in st.session_state:
@@ -297,11 +297,11 @@ if "refresh_count" not in st.session_state:
 
 
 def get_market_session():
-    """返回 (key, 中文标签, ET时间字符串)"""
+    """返回 (key, 中文标签, GMT时间字符串)"""
     now = datetime.now(ET)
     t   = now.time()
     wd  = now.weekday()
-    ts  = now.strftime("%H:%M ET")
+    ts  = now.strftime("%H:%M GMT")
 
     if wd >= 5:
         return "closed", "休市（周末）", ts
@@ -327,7 +327,7 @@ def fetch_1min(_cache_bust: int = 0):
 @st.cache_data(ttl=60)
 def fetch_history(period: str, interval: str):
     """历史数据，用 start/end 而非 period 避免 yfinance 内部缓存"""
-    ET_tz = pytz.timezone("America/New_York")
+    ET_tz = pytz.timezone("Europe/London")
     now   = datetime.now(ET_tz)
     # 根据 period 字符串换算 days_back
     _period_days = {"1d": 1, "5d": 5, "1mo": 30, "3mo": 92,
@@ -354,7 +354,13 @@ def fetch_rt_price(ticker: str):
 def build_df(tsla_raw, vix_raw):
     tc = tsla_raw["Close"].squeeze().rename("TSLA")
     vc = vix_raw["Close"].squeeze().rename("VIX")
-    return pd.concat([tc, vc], axis=1).dropna()
+    df = pd.concat([tc, vc], axis=1).dropna()
+    # 统一时区为 London（Ticker.history 返回 ET，download 返回 UTC，两者都处理）
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC").tz_convert(ET)
+    else:
+        df.index = df.index.tz_convert(ET)
+    return df
 
 
 def pearson_corr(df):
@@ -999,7 +1005,7 @@ def detect_divergence_live(
                 "last_tsla": None, "alert": False, "msg": ""}
 
     recent = df.iloc[-n_bars:].copy() if len(df) >= n_bars else df.copy()
-    now_ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+    now_ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S GMT")
 
     bars = []
     div_count = 0
@@ -1302,7 +1308,7 @@ def detect_vix_spike(
         return None
 
     v = vix_series.values.astype(float)
-    now_ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+    now_ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S GMT")
 
     last   = v[-1]
     prev1  = v[-2]
@@ -1415,7 +1421,7 @@ def detect_spot(
 
     base = df.iloc[-(spot_window + 1)]
     last = df.iloc[-1]
-    now_ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+    now_ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S GMT")
 
     vix_chg  = (float(last["VIX"])  - float(base["VIX"]))  / float(base["VIX"])  * 100
     tsla_chg = (float(last["TSLA"]) - float(base["TSLA"])) / float(base["TSLA"]) * 100
@@ -1526,7 +1532,7 @@ def detect_trend(
     # 方向一致性：60% 以上同向视为趋势（比 R²≥0.5 等效但响应更快）
     min_count = max(2, int(check_n * 0.6))
 
-    now_ts   = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+    now_ts   = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S GMT")
     vix_now  = float(df["VIX"].iloc[-1])
     tsla_now = float(df["TSLA"].iloc[-1])
     vix_total  = (vix_now - float(df["VIX"].iloc[-check_n])) / float(df["VIX"].iloc[-check_n]) * 100
@@ -1803,7 +1809,7 @@ st.markdown("---")
 # ══════════════════════════════════════════════════════════
 # 数据加载
 # ══════════════════════════════════════════════════════════
-now_str = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+now_str = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S GMT")
 
 with st.spinner("⏳ 正在拉取 1 分钟实时行情（含盘前数据）…"):
     tsla_1m_raw, vix_1m_raw = fetch_1min(_cache_bust=st.session_state.refresh_count)
@@ -1938,7 +1944,7 @@ if spike_enabled and len(df1m) >= 3:
 
 if spike_sig is not None:
     spike_now_dt  = datetime.now(ET)
-    spike_now_str = spike_now_dt.strftime("%Y-%m-%d %H:%M:%S ET")
+    spike_now_str = spike_now_dt.strftime("%Y-%m-%d %H:%M:%S GMT")
     spike_type    = spike_sig["type"]
     spike_last_t  = st.session_state.spike_alert_time.get(spike_type)
     spike_cool_ok = (
@@ -2010,7 +2016,7 @@ if pc_enabled:
             pc_interp["tg_worthy"] = False
 
     pc_now_dt  = datetime.now(ET)
-    pc_now_str = pc_now_dt.strftime("%Y-%m-%d %H:%M:%S ET")
+    pc_now_str = pc_now_dt.strftime("%Y-%m-%d %H:%M:%S GMT")
     pc_last_t  = st.session_state.pc_alert_time
     pc_cooldown_ok = (
         pc_last_t is None or
@@ -2067,7 +2073,7 @@ if strat_enabled:
 
         # Telegram：胜率超过用户设定阈值时推送
         strat_now_dt  = datetime.now(ET)
-        strat_now_str = strat_now_dt.strftime("%Y-%m-%d %H:%M:%S ET")
+        strat_now_str = strat_now_dt.strftime("%Y-%m-%d %H:%M:%S GMT")
         strat_last_t  = st.session_state.strat_alert_time
         strat_cool_ok = (
             strat_last_t is None or
@@ -2262,7 +2268,7 @@ with panel_spot:
           <div class="alert-msg" style="margin:6px 0 8px;font-size:12px">{sig_spot['desc_html']}</div>
           <div style="background:rgba(0,0,0,.3);border-radius:5px;padding:5px 8px;
                       font-size:12px;color:{action_clr};font-weight:700">{sig_spot['action']}</div>
-          <div class="alert-time" style="margin-top:6px">{tg_icon} · {now_dt.strftime('%H:%M:%S ET')}</div>
+          <div class="alert-time" style="margin-top:6px">{tg_icon} · {now_dt.strftime('%H:%M:%S GMT')}</div>
         </div>""", unsafe_allow_html=True)
     else:
         vc = "#ff3d6b" if _vix_spot_chg > 0 else "#3df5b0"
@@ -2302,7 +2308,7 @@ with panel_trend:
           <div class="alert-msg" style="margin:6px 0 8px;font-size:12px">{sig_trend['desc_html']}</div>
           <div style="background:rgba(0,0,0,.3);border-radius:5px;padding:5px 8px;
                       font-size:12px;color:{action_clr2};font-weight:700">{sig_trend['action']}</div>
-          <div class="alert-time" style="margin-top:6px">{tg_icon2} · {now_dt.strftime('%H:%M:%S ET')}</div>
+          <div class="alert-time" style="margin-top:6px">{tg_icon2} · {now_dt.strftime('%H:%M:%S GMT')}</div>
         </div>""", unsafe_allow_html=True)
     else:
         vc2 = "#ff3d6b" if _vix_slope > 0 else "#3df5b0"
@@ -2363,7 +2369,7 @@ if st.session_state.alert_history:
             <div class="alert-box {rec['css']}" style="padding:10px 14px;margin:4px 0">
               <div style="display:flex;justify-content:space-between;align-items:center">
                 <span>{mode_badge} <span class="alert-badge {rec['badge']}" style="font-size:9px">{rec['label']}</span></span>
-                <span class="alert-time">{sent_icon} {rec['time'].strftime('%m-%d %H:%M ET')}</span>
+                <span class="alert-time">{sent_icon} {rec['time'].strftime('%m-%d %H:%M GMT')}</span>
               </div>
               <div class="alert-msg" style="font-size:11px;margin-top:4px">{rec['desc_html']}</div>
             </div>""", unsafe_allow_html=True)
@@ -2372,7 +2378,7 @@ if st.session_state.alert_history:
 
 
 
-st.markdown('<div class="sec">01 — 1分钟实时走势（含盘前 04:00 / 盘后 16:00 ET）</div>',
+st.markdown('<div class="sec">01 — 1分钟实时走势（含盘前 04:00 / 盘后 16:00（纽约时间））</div>',
             unsafe_allow_html=True)
 
 # 标准化
@@ -2772,7 +2778,7 @@ elif divdash_result:
             for b in reversed(bars):
                 t_str = b["time"].tz_convert(ET).strftime("%H:%M") if hasattr(b["time"], "tz_convert") else str(b["time"])
                 rows_dd.append({
-                    "时间(ET)":    t_str,
+                    "时间(GMT)":    t_str,
                     "VIX":        f"{b['vix']:.2f}",
                     "VIX变化":    f"{b['vix_chg']:+.2f}%",
                     "TSLA":       f"${b['tsla']:.2f}",
@@ -2847,7 +2853,7 @@ else:
                 {s['action']}
               </div>
 
-              <div class="alert-time" style="margin-top:8px">{tg_icon} · {datetime.now(ET).strftime('%H:%M:%S ET')}</div>
+              <div class="alert-time" style="margin-top:8px">{tg_icon} · {datetime.now(ET).strftime('%H:%M:%S GMT')}</div>
             </div>""", unsafe_allow_html=True)
 
             if spike_tg_fired:
@@ -2904,8 +2910,8 @@ else:
         # 参数说明 + 历史
         last_sp_up   = st.session_state.spike_alert_time.get("vix_spike_up")
         last_sp_down = st.session_state.spike_alert_time.get("vix_spike_down")
-        up_str   = last_sp_up.strftime("%H:%M ET") if last_sp_up else "—"
-        down_str = last_sp_down.strftime("%H:%M ET") if last_sp_down else "—"
+        up_str   = last_sp_up.strftime("%H:%M GMT") if last_sp_up else "—"
+        down_str = last_sp_down.strftime("%H:%M GMT") if last_sp_down else "—"
         st.markdown(f"""
         <div style="font-family:'Space Mono',monospace;font-size:10px;color:#5a5c78;
                     background:#0e0f1a;border:1px solid #1e1f35;border-radius:10px;
@@ -2936,7 +2942,7 @@ else:
                       {ex_mark}{rec['emoji']} {rec['label']}
                     </span>
                     <span class="alert-time">
-                      {sent_icon} {rec['time'].strftime('%m-%d %H:%M:%S ET')}
+                      {sent_icon} {rec['time'].strftime('%m-%d %H:%M:%S GMT')}
                     </span>
                   </div>
                   <div style="font-family:'Space Mono',monospace;font-size:11px;
@@ -3141,7 +3147,7 @@ else:
                       {rec.get('emoji','')} {rec['label']}
                     </span>
                     <span style="font-family:'Space Mono',monospace;font-size:9px;color:#5a5c78">
-                      {sent_icon} P/C={ratio_str} · {rec['time'].strftime('%m-%d %H:%M ET')}
+                      {sent_icon} P/C={ratio_str} · {rec['time'].strftime('%m-%d %H:%M GMT')}
                     </span>
                   </div>
                   <div style="font-size:11px;color:#5a5c78;margin-top:4px">{rec['desc']}</div>
@@ -3286,7 +3292,7 @@ elif strat_wr:
                     <span style="color:{clr};font-weight:700;font-size:12px;
                                  font-family:'Space Mono',monospace">{rec['signal']}</span>
                     <span style="font-family:'Space Mono',monospace;font-size:9px;color:#5a5c78">
-                      {sent_icon} {rec['n_active']}/5因子 · {rec['time'].strftime('%m-%d %H:%M ET')}
+                      {sent_icon} {rec['n_active']}/5因子 · {rec['time'].strftime('%m-%d %H:%M GMT')}
                     </span>
                   </div>
                   <div style="font-family:'Space Mono',monospace;font-size:10px;

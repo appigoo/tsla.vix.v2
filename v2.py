@@ -291,6 +291,10 @@ html, body, [class*="css"] {
 
 ET = pytz.timezone("America/New_York")
 
+# session_state 必须在任何使用之前初始化
+if "refresh_count" not in st.session_state:
+    st.session_state.refresh_count = 0
+
 
 def get_market_session():
     """返回 (key, 中文标签, ET时间字符串)"""
@@ -1830,9 +1834,7 @@ r1m, p1m = pearson_corr(df1m)
 if "alert_history" not in st.session_state:
     st.session_state.alert_history = []
 if "last_alert_time" not in st.session_state:
-    st.session_state.last_alert_time = {}  # {type_str: datetime}
-if "refresh_count" not in st.session_state:
-    st.session_state.refresh_count = 0
+    st.session_state.last_alert_time = {}
 
 # ══════════════════════════════════════════════════════════
 # 背离仪表板：实时K线检测

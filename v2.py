@@ -183,6 +183,42 @@ html, body, [class*="css"] {
 .tg-status.err { background:#ff3d6b10; border:1px solid #ff3d6b55; color:#ff3d6b; }
 .tg-status.off { background:#5a5c7820; border:1px solid #5a5c7855; color:#5a5c78; }
 
+/* 期权流面板 */
+.pc-card {
+    background: var(--surf2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px 20px;
+    position: relative;
+    overflow: hidden;
+}
+.pc-card::after {
+    content:''; position:absolute;
+    top:0; left:0; right:0; height:3px;
+    border-radius:14px 14px 0 0;
+}
+.pc-card.bull::after { background: linear-gradient(90deg,#3df5b0,#00c896); }
+.pc-card.bear::after { background: linear-gradient(90deg,#ff3d6b,#cc0040); }
+.pc-card.neut::after { background: linear-gradient(90deg,#7b7bff,#5555cc); }
+
+.pc-signal {
+    display:inline-flex; align-items:center; gap:8px;
+    border-radius:8px; padding:6px 14px; margin:8px 0;
+    font-family:'Space Mono',monospace; font-size:11px; font-weight:700;
+}
+.pc-signal.bull { background:#3df5b020; border:1px solid #3df5b055; color:#3df5b0; }
+.pc-signal.bear { background:#ff3d6b20; border:1px solid #ff3d6b55; color:#ff3d6b; }
+.pc-signal.neut { background:#7b7bff20; border:1px solid #7b7bff55; color:#7b7bff; }
+
+.pc-bar-wrap {
+    background:#141525; border-radius:6px; height:10px;
+    overflow:hidden; margin:6px 0;
+}
+.pc-bar-fill {
+    height:100%; border-radius:6px;
+    transition: width .4s ease;
+}
+
 #MainMenu, footer, header { visibility:hidden; }
 </style>
 """, unsafe_allow_html=True)
@@ -287,9 +323,229 @@ def tag_session(index, tz=ET):
 
 
 
+
 # ══════════════════════════════════════════════════════════
-# Telegram 告警函数
+# 期权流：Put/Call 比率
 # ══════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=120)   # 2分钟缓存（期权链更新较慢）
+def fetch_pc_ratio(ticker: str = "TSLA") -> dict:
+    """
+    从 yfinance 拉取期权链，计算各到期日的 Put/Call 比率。
+
+    返回 dict：
+      ratio_volume   : 以成交量加权的综合 P/C 比率
+      ratio_oi       : 以未平仓量加权的综合 P/C 比率
+      put_vol        : 总 Put 成交量
+      call_vol       : 总 Call 成交量
+      put_oi         : 总 Put 未平仓量
+      call_oi        : 总 Call 未平仓量
+      by_expiry      : [{expiry, put_vol, call_vol, pc_vol, put_oi, call_oi, pc_oi}, ...]
+      near_expiry    : 最近到期日字符串
+      near_pc_vol    : 最近到期 P/C 成交量比率（更敏感）
+      near_pc_oi     : 最近到期 P/C 未平仓量比率
+      atm_skew       : ATM 附近 Put IV - Call IV（波动率偏斜）
+      timestamp      : 拉取时间
+      error          : 错误信息（正常为 None）
+    """
+    result = {
+        "ratio_volume": None, "ratio_oi": None,
+        "put_vol": 0, "call_vol": 0,
+        "put_oi": 0, "call_oi": 0,
+        "by_expiry": [], "near_expiry": None,
+        "near_pc_vol": None, "near_pc_oi": None,
+        "atm_skew": None,
+        "timestamp": datetime.now(ET).strftime("%H:%M:%S ET"),
+        "error": None,
+    }
+    try:
+        t = yf.Ticker(ticker)
+        exps = t.options  # 所有到期日列表
+        if not exps:
+            result["error"] = "无法获取期权到期日"
+            return result
+
+        # 只取最近 4 个到期日（流动性最好）
+        target_exps = exps[:4]
+        total_pv = total_cv = total_poi = total_coi = 0
+        by_expiry = []
+
+        for exp in target_exps:
+            try:
+                chain = t.option_chain(exp)
+                puts  = chain.puts
+                calls = chain.calls
+
+                pv  = int(puts["volume"].fillna(0).sum())
+                cv  = int(calls["volume"].fillna(0).sum())
+                poi = int(puts["openInterest"].fillna(0).sum())
+                coi = int(calls["openInterest"].fillna(0).sum())
+
+                total_pv  += pv
+                total_cv  += cv
+                total_poi += poi
+                total_coi += coi
+
+                pc_vol = round(pv / cv, 3) if cv > 0 else None
+                pc_oi  = round(poi / coi, 3) if coi > 0 else None
+
+                by_expiry.append({
+                    "expiry":   exp,
+                    "put_vol":  pv,  "call_vol":  cv,  "pc_vol":  pc_vol,
+                    "put_oi":   poi, "call_oi":   coi, "pc_oi":   pc_oi,
+                })
+            except Exception:
+                continue
+
+        result["put_vol"]  = total_pv
+        result["call_vol"] = total_cv
+        result["put_oi"]   = total_poi
+        result["call_oi"]  = total_coi
+        result["by_expiry"] = by_expiry
+
+        if total_cv > 0:
+            result["ratio_volume"] = round(total_pv / total_cv, 3)
+        if total_coi > 0:
+            result["ratio_oi"] = round(total_poi / total_coi, 3)
+
+        # 最近到期日详情
+        if by_expiry:
+            near = by_expiry[0]
+            result["near_expiry"]  = near["expiry"]
+            result["near_pc_vol"]  = near["pc_vol"]
+            result["near_pc_oi"]   = near["pc_oi"]
+
+        # ATM 波动率偏斜（最近到期日）
+        try:
+            spot = t.fast_info.last_price or 0
+            chain0 = t.option_chain(exps[0])
+            puts0  = chain0.puts.copy()
+            calls0 = chain0.calls.copy()
+            puts0["dist"]  = abs(puts0["strike"]  - spot)
+            calls0["dist"] = abs(calls0["strike"] - spot)
+            near_put  = puts0.nsmallest(3, "dist")
+            near_call = calls0.nsmallest(3, "dist")
+            avg_put_iv  = float(near_put["impliedVolatility"].mean())
+            avg_call_iv = float(near_call["impliedVolatility"].mean())
+            result["atm_skew"] = round((avg_put_iv - avg_call_iv) * 100, 2)
+        except Exception:
+            pass
+
+        return result
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
+
+def interpret_pc(ratio_vol: float | None, ratio_oi: float | None,
+                 near_vol: float | None, atm_skew: float | None) -> dict:
+    """
+    根据 P/C 比率生成交易信号。
+
+    P/C 比率解读（TSLA 历史经验值）：
+      < 0.5  → 过度乐观（Call 主导），逆向看：短期可能见顶，偏空参考
+      0.5–0.7→ 轻微看涨情绪，市场整体偏多
+      0.7–1.0→ 中性，多空均衡
+      1.0–1.3→ 偏向防御/看跌，市场情绪谨慎
+      > 1.3  → 过度悲观（Put 主导），逆向看：短期可能见底，偏多参考
+    """
+    # 主信号基于成交量比率（更实时），辅以 OI 比率
+    primary = ratio_vol if ratio_vol is not None else ratio_oi
+
+    if primary is None:
+        return {
+            "signal": "neutral", "css": "neut", "emoji": "⚪",
+            "label": "数据不足", "action": "—",
+            "strength": 0, "desc": "无法获取期权数据",
+            "tg_worthy": False,
+        }
+
+    # 信号强度（0–100）
+    if primary < 0.4:
+        signal, css, emoji = "bearish_contrarian", "bear", "🔴"
+        label  = "极度看涨情绪（逆向偏空）"
+        action = "⚠️ Call 严重堆积，市场过热，逆向参考：留意短期回调风险"
+        strength = int(min(100, (0.4 - primary) / 0.4 * 100 + 60))
+        tg_worthy = True
+    elif primary < 0.6:
+        signal, css, emoji = "bullish", "bull", "🟢"
+        label  = "看涨情绪偏强"
+        action = "✅ Call 主导，市场偏多，顺势参考：TSLA 短期看涨"
+        strength = int(60 + (0.6 - primary) / 0.2 * 20)
+        tg_worthy = primary < 0.5
+    elif primary < 0.85:
+        signal, css, emoji = "neutral", "neut", "🔵"
+        label  = "市场情绪中性"
+        action = "📊 多空均衡，无明显方向性信号"
+        strength = 50
+        tg_worthy = False
+    elif primary < 1.1:
+        signal, css, emoji = "cautious", "neut", "🟡"
+        label  = "谨慎/轻微偏空"
+        action = "⚠️ Put 略多，市场出现防御迹象，关注支撑位"
+        strength = int(50 + (primary - 0.85) / 0.25 * 20)
+        tg_worthy = False
+    elif primary < 1.5:
+        signal, css, emoji = "bearish", "bear", "🔴"
+        label  = "看空情绪偏强"
+        action = "⚠️ Put 主导，市场偏空，顺势参考：TSLA 短期承压"
+        strength = int(65 + (primary - 1.1) / 0.4 * 20)
+        tg_worthy = True
+    else:
+        signal, css, emoji = "bullish_contrarian", "bull", "🟢"
+        label  = "极度看空情绪（逆向偏多）"
+        action = "✅ Put 严重堆积，恐慌见底信号，逆向参考：考虑做多"
+        strength = int(min(100, (primary - 1.5) / 0.5 * 100 + 70))
+        tg_worthy = True
+
+    # 附加信息：ATM 偏斜
+    skew_note = ""
+    if atm_skew is not None:
+        if atm_skew > 5:
+            skew_note = f"Put IV 溢价 {atm_skew:.1f}%（市场对下行风险定价偏高）"
+        elif atm_skew < -3:
+            skew_note = f"Call IV 溢价 {abs(atm_skew):.1f}%（市场对上行动能定价偏高）"
+        else:
+            skew_note = f"ATM 偏斜中性（{atm_skew:+.1f}%）"
+
+    desc = f"综合 P/C={primary:.3f}"
+    if near_vol:
+        desc += f"，近月 P/C={near_vol:.3f}"
+    if skew_note:
+        desc += f"，{skew_note}"
+
+    return {
+        "signal": signal, "css": css, "emoji": emoji,
+        "label": label, "action": action,
+        "strength": strength, "desc": desc,
+        "tg_worthy": tg_worthy,
+        "primary": primary,
+    }
+
+
+def pc_tg_msg(pc_data: dict, interp: dict, now_ts: str) -> str:
+    """生成期权流 Telegram 消息"""
+    rv = pc_data.get("ratio_volume")
+    ro = pc_data.get("ratio_oi")
+    nv = pc_data.get("near_pc_vol")
+    sk = pc_data.get("atm_skew")
+    pv = pc_data.get("put_vol", 0)
+    cv = pc_data.get("call_vol", 0)
+
+    skew_str = f"{sk:+.1f}%" if sk is not None else "N/A"
+    return (
+        f"{interp['emoji']} <b>[期权流信号] {interp['label']}</b>\n\n"
+        f"📊 Put/Call 成交量比率：<b>{rv:.3f}</b>\n"
+        f"📊 Put/Call 未平仓量比率：<b>{ro:.3f}</b>\n"
+        f"📊 近月 P/C 成交量：<b>{nv:.3f}</b>\n\n"
+        f"📈 总 Call 成交量：{cv:,}\n"
+        f"📉 总 Put 成交量：{pv:,}\n"
+        f"⚖️ ATM 波动率偏斜：{skew_str}\n\n"
+        f"💡 <b>操作参考</b>：{interp['action']}\n\n"
+        f"🕐 {now_ts}"
+    )
+
+
 
 def tg_send(bot_token: str, chat_id: str, text: str) -> tuple[bool, str]:
     """发送 Telegram 消息，返回 (成功, 信息)"""
@@ -525,6 +781,16 @@ with st.sidebar:
     roll_window = st.slider("滚动相关窗口（根 K 线）", 5, 60, 20)
     normalize   = st.checkbox("标准化叠加（Z-Score）", value=True)
 
+    # ── 期权流配置
+    st.markdown('<div class="sec">📊 期权流 Put/Call 监控</div>', unsafe_allow_html=True)
+    pc_enabled     = st.checkbox("启用期权流信号", value=True)
+    pc_bull_thresh = st.slider("看涨信号阈值（P/C <）", 0.3, 0.8, 0.6, step=0.05,
+                               help="P/C 低于此值触发看涨/逆向偏空预警")
+    pc_bear_thresh = st.slider("看空信号阈值（P/C >）", 0.8, 2.0, 1.1, step=0.05,
+                               help="P/C 高于此值触发看空/逆向偏多预警")
+    pc_cooldown    = st.slider("期权流冷却时间（分钟）", 5, 120, 30,
+                               help="期权链数据更新慢，建议冷却时间较长")
+
     # ── Telegram 告警配置 ────────────────────────────────
     st.markdown('<div class="sec">📲 Telegram 告警设置</div>', unsafe_allow_html=True)
 
@@ -565,7 +831,7 @@ with st.sidebar:
 
     # ── 单点变化检测参数
     st.markdown("**① 单点变化（快速预警）**")
-    spot_window      = st.slider("单点观察窗口（分钟）", 1, 15, 5,
+    spot_window      = st.slider("单点观察窗口（分钟）", 2, 15, 5,
                                  help="比较最近 N 分钟首尾变化幅度，反应快但易受噪音影响")
     vix_thresh       = st.slider("VIX 单点变化阈值（%）", 0.3, 5.0, 1.0, step=0.1,
                                  help="VIX 变动超过此值即触发检测")
@@ -706,7 +972,71 @@ for sig in all_signals:
             if st.session_state.alert_history:
                 st.session_state.alert_history[0]["sent"] = True
 
-# ── 实时报价
+# ══════════════════════════════════════════════════════════
+# 期权流 Put/Call 比率（独立信号）
+# ══════════════════════════════════════════════════════════
+if "pc_alert_time" not in st.session_state:
+    st.session_state.pc_alert_time = None
+if "pc_history" not in st.session_state:
+    st.session_state.pc_history = []
+
+pc_data   = {}
+pc_interp = {}
+pc_tg_fired = None
+
+if pc_enabled:
+    with st.spinner("⏳ 正在拉取 TSLA 期权链数据…"):
+        pc_data = fetch_pc_ratio("TSLA")
+
+    pc_interp = interpret_pc(
+        pc_data.get("ratio_volume"),
+        pc_data.get("ratio_oi"),
+        pc_data.get("near_pc_vol"),
+        pc_data.get("atm_skew"),
+    )
+
+    # 用用户自定义阈值覆盖默认触发判断
+    primary_pc = pc_data.get("ratio_volume") or pc_data.get("ratio_oi")
+    if primary_pc is not None:
+        if primary_pc < pc_bull_thresh or primary_pc > pc_bear_thresh:
+            pc_interp["tg_worthy"] = True
+        else:
+            pc_interp["tg_worthy"] = False
+
+    pc_now_dt  = datetime.now(ET)
+    pc_now_str = pc_now_dt.strftime("%Y-%m-%d %H:%M:%S ET")
+    pc_last_t  = st.session_state.pc_alert_time
+    pc_cooldown_ok = (
+        pc_last_t is None or
+        (pc_now_dt - pc_last_t).total_seconds() >= pc_cooldown * 60
+    )
+
+    # Telegram 推送（独立冷却）
+    if pc_interp.get("tg_worthy") and pc_cooldown_ok:
+        if tg_enabled and tg_token and tg_chat_id:
+            msg_pc = pc_tg_msg(pc_data, pc_interp, pc_now_str)
+            ok_pc, err_pc = tg_send(tg_token, tg_chat_id, msg_pc)
+            pc_tg_fired = (ok_pc, err_pc)
+            if ok_pc:
+                st.session_state.pc_alert_time = pc_now_dt
+
+    # 写入期权流历史
+    if pc_interp.get("tg_worthy"):
+        already_pc = (
+            st.session_state.pc_history and
+            (pc_now_dt - st.session_state.pc_history[0]["time"]).total_seconds() < 120
+        )
+        if not already_pc and primary_pc is not None:
+            st.session_state.pc_history.insert(0, {
+                "label":  pc_interp["label"],
+                "css":    pc_interp["css"],
+                "emoji":  pc_interp["emoji"],
+                "desc":   pc_interp["desc"],
+                "ratio":  primary_pc,
+                "time":   pc_now_dt,
+                "sent":   bool(pc_tg_fired and pc_tg_fired[0]),
+            })
+            st.session_state.pc_history = st.session_state.pc_history[:30]
 tsla_rt, tsla_prev = fetch_rt_price("TSLA")
 vix_rt,  vix_prev  = fetch_rt_price("^VIX")
 
@@ -1235,8 +1565,207 @@ if r1m is not None:
                  })
 
 # ══════════════════════════════════════════════════════════
-# 页脚
+# 期权流面板 UI
 # ══════════════════════════════════════════════════════════
+st.markdown('<div class="sec">📊 期权流信号 — TSLA Put/Call 比率（独立信号）</div>',
+            unsafe_allow_html=True)
+
+if not pc_enabled:
+    st.markdown("""
+    <div style="font-family:'Space Mono',monospace;font-size:11px;color:#5a5c78;
+                padding:14px;border:1px solid #1e1f35;border-radius:10px">
+    📵 期权流监控已关闭，在侧边栏启用「期权流 Put/Call 监控」
+    </div>""", unsafe_allow_html=True)
+
+elif pc_data.get("error"):
+    st.markdown(f"""
+    <div style="background:#ff3d6b10;border:1px solid #ff3d6b55;border-radius:10px;
+                padding:14px;font-family:'Space Mono',monospace;font-size:11px;color:#ff3d6b">
+    ⚠ 期权数据获取失败：{pc_data['error']}<br>
+    <span style="color:#5a5c78">Yahoo Finance 期权链在非交易时段可能返回空数据，盘中效果最佳。</span>
+    </div>""", unsafe_allow_html=True)
+
+else:
+    rv       = pc_data.get("ratio_volume")
+    ro       = pc_data.get("ratio_oi")
+    nv       = pc_data.get("near_pc_vol")
+    no_      = pc_data.get("near_pc_oi")
+    pv       = pc_data.get("put_vol", 0)
+    cv       = pc_data.get("call_vol", 0)
+    poi      = pc_data.get("put_oi", 0)
+    coi      = pc_data.get("call_oi", 0)
+    skew     = pc_data.get("atm_skew")
+    near_exp = pc_data.get("near_expiry", "—")
+    by_exp   = pc_data.get("by_expiry", [])
+    css      = pc_interp.get("css", "neut")
+    emoji    = pc_interp.get("emoji", "⚪")
+    label    = pc_interp.get("label", "—")
+    action   = pc_interp.get("action", "—")
+    desc     = pc_interp.get("desc", "—")
+    strength = pc_interp.get("strength", 50)
+    ac       = {"bull": "#3df5b0", "bear": "#ff3d6b", "neut": "#7b7bff"}.get(css, "#7b7bff")
+
+    # ── 顶部指标行
+    pc1, pc2, pc3, pc4 = st.columns(4)
+
+    with pc1:
+        rv_str = f"{rv:.3f}" if rv else "—"
+        st.markdown(f"""
+        <div class="kcard {css}">
+          <div class="klabel">P/C 成交量比率（综合）</div>
+          <div class="kval {css}" style="font-size:28px">{rv_str}</div>
+          <div class="ksub">Put {pv:,} · Call {cv:,}</div>
+        </div>""", unsafe_allow_html=True)
+
+    with pc2:
+        ro_str = f"{ro:.3f}" if ro else "—"
+        st.markdown(f"""
+        <div class="kcard {css}">
+          <div class="klabel">P/C 未平仓量比率（综合）</div>
+          <div class="kval {css}" style="font-size:28px">{ro_str}</div>
+          <div class="ksub">Put OI {poi:,} · Call OI {coi:,}</div>
+        </div>""", unsafe_allow_html=True)
+
+    with pc3:
+        nv_str = f"{nv:.3f}" if nv else "—"
+        st.markdown(f"""
+        <div class="kcard {css}">
+          <div class="klabel">近月 P/C（{near_exp}）</div>
+          <div class="kval {css}" style="font-size:28px">{nv_str}</div>
+          <div class="ksub">近月最敏感，流动性最好</div>
+        </div>""", unsafe_allow_html=True)
+
+    with pc4:
+        skew_str   = f"{skew:+.1f}%" if skew is not None else "—"
+        skew_color = "#ff3d6b" if skew and skew > 3 else ("#3df5b0" if skew and skew < -2 else "#7b7bff")
+        skew_label = "Put 溢价（偏空）" if skew and skew > 3 else ("Call 溢价（偏多）" if skew and skew < -2 else "ATM 偏斜中性")
+        st.markdown(f"""
+        <div class="kcard p">
+          <div class="klabel">ATM 波动率偏斜（Put IV − Call IV）</div>
+          <div class="kval p" style="font-size:26px;color:{skew_color}">{skew_str}</div>
+          <div class="ksub">{skew_label}</div>
+        </div>""", unsafe_allow_html=True)
+
+    # ── 信号解读 + 各到期日明细
+    sig_col, detail_col = st.columns([3, 2])
+
+    with sig_col:
+        # 信号强度条
+        bar_color = ac
+        st.markdown(f"""
+        <div class="pc-card {css}">
+          <div class="klabel" style="margin-bottom:8px">期权流信号研判</div>
+          <div class="pc-signal {css}">{emoji} {label}</div>
+          <div style="margin:10px 0 4px;font-family:'Space Mono',monospace;
+                      font-size:10px;color:#5a5c78">信号强度</div>
+          <div class="pc-bar-wrap">
+            <div class="pc-bar-fill" style="width:{strength}%;
+                 background:linear-gradient(90deg,{bar_color}88,{bar_color})"></div>
+          </div>
+          <div style="font-family:'Space Mono',monospace;font-size:10px;
+                      color:{bar_color};margin-bottom:10px">{strength}/100</div>
+          <div style="background:rgba(0,0,0,.25);border-radius:8px;padding:10px 12px;
+                      font-size:13px;color:{ac};font-weight:700;margin-bottom:10px">
+            {action}
+          </div>
+          <div style="font-family:'Space Mono',monospace;font-size:11px;
+                      color:#5a5c78;line-height:1.8">{desc}</div>
+        </div>""", unsafe_allow_html=True)
+
+        # Telegram 状态
+        if pc_interp.get("tg_worthy"):
+            if pc_tg_fired:
+                tg_ic = "✅ 期权流 Telegram 已推送" if pc_tg_fired[0] else f"❌ 推送失败：{pc_tg_fired[1]}"
+                tg_cl = "ok" if pc_tg_fired[0] else "err"
+            else:
+                last_pc = st.session_state.pc_alert_time
+                if last_pc:
+                    mins = int((datetime.now(ET) - last_pc).total_seconds() / 60)
+                    tg_ic = f"⏱ 冷却中（{mins}/{pc_cooldown} 分钟）"
+                else:
+                    tg_ic = "📵 Telegram 未启用" if not tg_enabled else "⏱ 冷却中"
+                tg_cl = "off"
+            st.markdown(f'<div class="tg-status {tg_cl}" style="margin-top:6px">📊 {tg_ic}</div>',
+                        unsafe_allow_html=True)
+
+    with detail_col:
+        # 各到期日明细
+        st.markdown("""
+        <div style="font-family:'Space Mono',monospace;font-size:10px;
+                    letter-spacing:1px;color:#5a5c78;margin-bottom:8px">
+        各到期日 P/C 明细
+        </div>""", unsafe_allow_html=True)
+
+        if by_exp:
+            for row in by_exp:
+                exp     = row["expiry"]
+                pc_v    = row.get("pc_vol")
+                pc_o    = row.get("pc_oi")
+                rv_disp = f"{pc_v:.2f}" if pc_v else "—"
+                ro_disp = f"{pc_o:.2f}" if pc_o else "—"
+                # 颜色：<0.7 绿，>1.0 红，其他蓝
+                v_col = "#3df5b0" if pc_v and pc_v < 0.7 else ("#ff3d6b" if pc_v and pc_v > 1.0 else "#7b7bff")
+                pct_call = int(row["call_vol"] / (row["call_vol"] + row["put_vol"]) * 100) if (row["call_vol"] + row["put_vol"]) > 0 else 50
+                st.markdown(f"""
+                <div style="background:#141525;border:1px solid #1e1f35;border-radius:8px;
+                            padding:10px 12px;margin-bottom:6px">
+                  <div style="display:flex;justify-content:space-between;
+                              font-family:'Space Mono',monospace;font-size:10px">
+                    <span style="color:#dde1f5;font-weight:700">{exp}</span>
+                    <span style="color:{v_col}">P/C={rv_disp}</span>
+                  </div>
+                  <div style="margin:6px 0 3px;height:6px;background:#0e0f1a;border-radius:3px;overflow:hidden">
+                    <div style="height:100%;width:{pct_call}%;
+                                background:linear-gradient(90deg,#3df5b0,#00c896);border-radius:3px"></div>
+                  </div>
+                  <div style="font-family:'Space Mono',monospace;font-size:9px;color:#5a5c78;
+                              display:flex;justify-content:space-between">
+                    <span>Call {row['call_vol']:,}</span>
+                    <span>Put {row['put_vol']:,}</span>
+                  </div>
+                </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="color:#5a5c78;font-size:11px">暂无到期日数据</div>',
+                        unsafe_allow_html=True)
+
+    # ── P/C 比率参考区间说明
+    st.markdown(f"""
+    <div style="font-family:'Space Mono',monospace;font-size:10px;color:#5a5c78;
+                background:#0e0f1a;border:1px solid #1e1f35;border-radius:8px;
+                padding:10px 14px;margin-top:8px;line-height:2">
+      <b style="color:#dde1f5">P/C 比率参考区间（TSLA 经验值）</b> &nbsp;·&nbsp;
+      当前触发阈值：看涨 &lt; {pc_bull_thresh:.2f}，看空 &gt; {pc_bear_thresh:.2f}<br>
+      &lt;0.4 极度乐观（逆向偏空）&nbsp;·&nbsp;
+      0.4–0.6 偏多&nbsp;·&nbsp;
+      0.6–0.85 中性偏多&nbsp;·&nbsp;
+      0.85–1.1 中性&nbsp;·&nbsp;
+      1.1–1.5 偏空&nbsp;·&nbsp;
+      &gt;1.5 极度悲观（逆向偏多）&nbsp;·&nbsp;
+      更新间隔：约 2 分钟 · 冷却：{pc_cooldown} 分钟
+    </div>""", unsafe_allow_html=True)
+
+    # ── 期权流历史
+    if st.session_state.pc_history:
+        with st.expander(f"📋 期权流信号历史（共 {len(st.session_state.pc_history)} 条）",
+                         expanded=False):
+            for rec in st.session_state.pc_history:
+                sent_icon = "📲" if rec.get("sent") else "🔕"
+                ratio_str = f"{rec['ratio']:.3f}" if rec.get("ratio") else "—"
+                clr = {"bull": "#3df5b0", "bear": "#ff3d6b", "neut": "#7b7bff"}.get(rec.get("css"), "#7b7bff")
+                st.markdown(f"""
+                <div class="pc-card {rec.get('css','neut')}" style="padding:10px 14px;margin:4px 0">
+                  <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span style="color:{clr};font-weight:700;font-size:12px">
+                      {rec.get('emoji','')} {rec['label']}
+                    </span>
+                    <span style="font-family:'Space Mono',monospace;font-size:9px;color:#5a5c78">
+                      {sent_icon} P/C={ratio_str} · {rec['time'].strftime('%m-%d %H:%M ET')}
+                    </span>
+                  </div>
+                  <div style="font-size:11px;color:#5a5c78;margin-top:4px">{rec['desc']}</div>
+                </div>""", unsafe_allow_html=True)
+
+
 refresh_info = "下次刷新：30 秒后" if auto_refresh else "自动刷新已关闭"
 st.markdown(f"""
 <div style="font-family:'Space Mono',monospace;font-size:10px;color:#22233a;

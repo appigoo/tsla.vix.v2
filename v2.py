@@ -264,6 +264,23 @@ html, body, [class*="css"] {
     transition: width .4s ease;
 }
 
+/* 背离仪表板 */
+.divdash-alert {
+    border-radius: 12px; padding: 14px 18px; margin: 8px 0;
+    border-left: 4px solid;
+    font-family: 'Space Mono', monospace;
+}
+.divdash-alert.up   { background:#ff8c0012; border-color:#ff8c00; }
+.divdash-alert.down { background:#3df5b012; border-color:#3df5b0; }
+.divdash-alert.sync { background:#7b7bff12; border-color:#7b7bff; }
+.divdash-alert.none { background:#1e1f35;   border-color:#2a2b45; }
+.divdash-bar { display:flex; align-items:center; gap:6px; margin:3px 0;
+               font-size:11px; }
+.divdash-label { color:#5a5c78; width:80px; flex-shrink:0; }
+.divdash-track { flex:1; height:6px; background:#141525;
+                 border-radius:3px; overflow:hidden; }
+.divdash-fill  { height:100%; border-radius:3px; }
+
 #MainMenu, footer, header { visibility:hidden; }
 </style>
 """, unsafe_allow_html=True)
@@ -933,6 +950,288 @@ def strategy_tg_msg(factors: dict, wr: dict, price: float | None, now_ts: str) -
     return "\n".join(lines)
 
 
+# ══════════════════════════════════════════════════════════
+# 背离仪表板：K线同框实时背离检测
+# ══════════════════════════════════════════════════════════
+
+def detect_divergence_live(
+    df: pd.DataFrame,
+    n_bars: int = 15,
+    div_thresh_vix: float = 0.5,    # VIX 变化超过此 % 视为有效移动
+    div_thresh_tsla: float = 0.3,   # TSLA 理论上应跟随的最小 % 变化
+) -> dict:
+    """
+    分析最近 n_bars 根 1 分钟 K 线，逐根判断背离。
+
+    背离定义：
+      VIX 移动幅度 >= div_thresh_vix%
+      但 TSLA 未以反向幅度 >= div_thresh_tsla% 跟随
+
+    返回 dict：
+      status     : "div_up"（VIX↑TSLA未跌）| "div_down"（VIX↓TSLA未涨）
+                   | "sync"（同步）| "flat"（VIX未动）
+      bars       : 最近 n_bars 根的逐根分析列表
+      div_count  : 当前窗口内背离根数
+      div_pct    : 背离比例（背离根数 / 有效移动根数）
+      vix_total  : 窗口总变化
+      tsla_total : 窗口总变化
+      last_vix   : 最新VIX值
+      last_tsla  : 最新TSLA价格
+      alert      : 最近1根是否背离（True/False）
+      msg        : Telegram 消息文本
+    """
+    if len(df) < 3:
+        return {"status": "flat", "bars": [], "div_count": 0, "div_pct": 0,
+                "vix_total": 0, "tsla_total": 0, "last_vix": None,
+                "last_tsla": None, "alert": False, "msg": ""}
+
+    recent = df.iloc[-n_bars:].copy() if len(df) >= n_bars else df.copy()
+    now_ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S ET")
+
+    bars = []
+    div_count = 0
+    valid_count = 0   # VIX 有效移动根数
+
+    vix_vals  = recent["VIX"].values.astype(float)
+    tsla_vals = recent["TSLA"].values.astype(float)
+
+    for i in range(1, len(recent)):
+        vix_chg  = (vix_vals[i]  - vix_vals[i-1]) / vix_vals[i-1]  * 100 if vix_vals[i-1]  != 0 else 0.0
+        tsla_chg = (tsla_vals[i] - tsla_vals[i-1]) / tsla_vals[i-1] * 100 if tsla_vals[i-1] != 0 else 0.0
+
+        vix_moved = abs(vix_chg) >= div_thresh_vix
+
+        if vix_moved:
+            valid_count += 1
+            # 背离：VIX 上升但 TSLA 未跌（或跌幅不足）
+            if vix_chg > 0 and tsla_chg > -div_thresh_tsla:
+                bar_status = "div_up"
+                div_count += 1
+            # 背离：VIX 下降但 TSLA 未涨（或涨幅不足）
+            elif vix_chg < 0 and tsla_chg < div_thresh_tsla:
+                bar_status = "div_down"
+                div_count += 1
+            else:
+                bar_status = "sync"
+        else:
+            bar_status = "flat"
+
+        bars.append({
+            "time":      recent.index[i],
+            "vix":       vix_vals[i],
+            "tsla":      tsla_vals[i],
+            "vix_chg":   vix_chg,
+            "tsla_chg":  tsla_chg,
+            "status":    bar_status,
+        })
+
+    # 整体判断：以最近3根为主，权重向最新倾斜
+    last_bar    = bars[-1] if bars else {}
+    last_status = last_bar.get("status", "flat")
+    alert       = last_status in ("div_up", "div_down")
+
+    # 窗口总变化
+    vix_total  = (vix_vals[-1] - vix_vals[0]) / vix_vals[0]  * 100 if vix_vals[0]  != 0 else 0.0
+    tsla_total = (tsla_vals[-1] - tsla_vals[0]) / tsla_vals[0] * 100 if tsla_vals[0] != 0 else 0.0
+    div_pct    = div_count / valid_count if valid_count > 0 else 0.0
+
+    # 整体状态：以最后3根中的多数方向判断
+    recent3 = [b["status"] for b in bars[-3:]] if len(bars) >= 3 else [last_status]
+    up3   = recent3.count("div_up")
+    dn3   = recent3.count("div_down")
+    sy3   = recent3.count("sync")
+    if up3 >= 2:
+        status = "div_up"
+    elif dn3 >= 2:
+        status = "div_down"
+    elif sy3 >= 2:
+        status = "sync"
+    else:
+        status = last_status if last_status != "flat" else "flat"
+
+    # Telegram 消息
+    if status == "div_up":
+        emoji = "🟠"; head = "VIX 持续上升，TSLA 未跟跌（背离）"
+        action = "⚠️ TSLA 补跌概率高，考虑减仓/做空"
+    elif status == "div_down":
+        emoji = "🔵"; head = "VIX 持续下降，TSLA 未跟涨（背离）"
+        action = "✅ TSLA 补涨概率高，考虑做多/加仓"
+    else:
+        emoji = ""; head = ""; action = ""
+
+    msg = ""
+    if status in ("div_up", "div_down"):
+        msg = (
+            f"{emoji} <b>[K线背离仪表板] {head}</b>\n\n"
+            f"📊 最近 {n_bars} 根 K 线分析\n"
+            f"   背离根数：{div_count} / {valid_count} 有效移动（{div_pct:.0%}）\n"
+            f"   VIX  窗口变化：{vix_total:+.2f}%（当前 {vix_vals[-1]:.2f}）\n"
+            f"   TSLA 窗口变化：{tsla_total:+.2f}%（当前 ${tsla_vals[-1]:.2f}）\n\n"
+            f"💡 <b>操作参考</b>：{action}\n\n"
+            f"🕐 {now_ts}"
+        )
+
+    return {
+        "status":     status,
+        "bars":       bars,
+        "div_count":  div_count,
+        "div_pct":    div_pct,
+        "valid_count": valid_count,
+        "vix_total":  vix_total,
+        "tsla_total": tsla_total,
+        "last_vix":   float(vix_vals[-1]),
+        "last_tsla":  float(tsla_vals[-1]),
+        "alert":      alert,
+        "status_last": last_status,
+        "msg":        msg,
+        "now_ts":     now_ts,
+    }
+
+
+def build_divdash_chart(df: pd.DataFrame, n_bars: int = 15, div_result: dict = None) -> go.Figure:
+    """
+    构建 VIX + TSLA 双 K 线同框图表，背离根高亮。
+    上图：VIX K线 + 背离标注
+    下图：TSLA K线 + 背离标注
+    """
+    recent = df.iloc[-n_bars:].copy() if len(df) >= n_bars else df.copy()
+    bars   = div_result.get("bars", []) if div_result else []
+
+    # 背离颜色 map：status → bar bgcolor (用 vrect 高亮)
+    STATUS_COLOR = {
+        "div_up":   "rgba(255,140,0,0.15)",
+        "div_down": "rgba(61,245,176,0.15)",
+        "sync":     "rgba(123,123,255,0.07)",
+        "flat":     "rgba(0,0,0,0)",
+    }
+
+    # 构建 OHLC（1分钟K线，用close作为OHLC近似，因为df1m只有close）
+    # 实际用折线+散点，清晰展示每根收盘价变化
+    times = list(recent.index)
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        subplot_titles=["VIX 指数（1分钟）", "TSLA 股价（1分钟）"],
+        row_heights=[0.5, 0.5],
+    )
+
+    vix_vals  = recent["VIX"].values.astype(float)
+    tsla_vals = recent["TSLA"].values.astype(float)
+
+    # 逐根颜色（基于背离状态）
+    def _bar_colors(col_key):
+        colors = []
+        for b in bars:
+            st = b["status"]
+            if st == "div_up":
+                colors.append("#ff8c00")
+            elif st == "div_down":
+                colors.append("#3df5b0")
+            elif st == "sync":
+                colors.append("#7b7bff")
+            else:
+                colors.append("#5a5c78")
+        # 第一根无前一根，默认灰色
+        return ["#5a5c78"] + colors if len(colors) < len(times) else colors
+
+    bar_colors = _bar_colors("status")
+
+    # ── VIX 折线 + 散点（颜色按背离状态）
+    fig.add_trace(go.Scatter(
+        x=times, y=vix_vals,
+        mode="lines",
+        line=dict(color="#ff3d6b", width=1.5),
+        name="VIX",
+        showlegend=True,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=times, y=vix_vals,
+        mode="markers",
+        marker=dict(color=bar_colors, size=7, line=dict(width=1, color="#0e0f1a")),
+        name="VIX点",
+        showlegend=False,
+        hovertemplate="VIX: %{y:.2f}<extra></extra>",
+    ), row=1, col=1)
+
+    # ── TSLA 折线 + 散点
+    fig.add_trace(go.Scatter(
+        x=times, y=tsla_vals,
+        mode="lines",
+        line=dict(color="#7b7bff", width=1.5),
+        name="TSLA",
+        showlegend=True,
+    ), row=2, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=times, y=tsla_vals,
+        mode="markers",
+        marker=dict(color=bar_colors, size=7, line=dict(width=1, color="#0e0f1a")),
+        name="TSLA点",
+        showlegend=False,
+        hovertemplate="TSLA: $%{y:.2f}<extra></extra>",
+    ), row=2, col=1)
+
+    # ── 背离高亮竖条（vrect）
+    for b in bars:
+        c = STATUS_COLOR.get(b["status"], "rgba(0,0,0,0)")
+        if c == "rgba(0,0,0,0)":
+            continue
+        t_idx = list(recent.index).index(b["time"]) if b["time"] in recent.index else -1
+        if t_idx <= 0:
+            continue
+        x0 = recent.index[t_idx - 1]
+        x1 = b["time"]
+        for row in (1, 2):
+            fig.add_vrect(x0=x0, x1=x1, fillcolor=c, layer="below",
+                          line_width=0, row=row, col=1)
+
+    # ── 最新一根特别标注
+    if len(times) > 0:
+        last_status = div_result.get("status_last", "flat") if div_result else "flat"
+        ann_color = {"div_up": "#ff8c00", "div_down": "#3df5b0",
+                     "sync": "#7b7bff", "flat": "#5a5c78"}.get(last_status, "#5a5c78")
+        ann_text  = {"div_up": "⚠ 背离↑", "div_down": "✅ 背离↓",
+                     "sync": "✓ 同步", "flat": "—"}.get(last_status, "")
+        if ann_text:
+            fig.add_annotation(
+                x=times[-1], y=vix_vals[-1],
+                text=ann_text, showarrow=True, arrowhead=2,
+                font=dict(color=ann_color, size=11, family="Space Mono"),
+                arrowcolor=ann_color, ax=20, ay=-28, row=1, col=1,
+            )
+
+    # ── 图表样式
+    DARK = "#0e0f1a"
+    GRID = "#141525"
+    fig.update_layout(
+        paper_bgcolor=DARK, plot_bgcolor=DARK,
+        font=dict(color="#5a5c78", size=10, family="Space Mono"),
+        margin=dict(l=10, r=10, t=36, b=8),
+        height=420,
+        hovermode="x unified",
+        legend=dict(bgcolor=DARK, bordercolor="#1e1f35", borderwidth=1,
+                    font=dict(color="#dde1f5", size=10),
+                    orientation="h", x=0, y=1.05),
+        showlegend=True,
+    )
+    for row in (1, 2):
+        fig.update_xaxes(gridcolor=GRID, zeroline=False, showgrid=True,
+                         tickfont=dict(size=9), row=row, col=1)
+        fig.update_yaxes(gridcolor=GRID, zeroline=False, showgrid=True,
+                         tickfont=dict(size=9), row=row, col=1)
+    # 副标题颜色
+    fig.update_annotations(font=dict(color="#dde1f5", size=10, family="Space Mono"))
+
+    return fig
+
+
+def tg_divdash_msg(result: dict) -> str:
+    return result.get("msg", "")
+
+
 def tg_send(bot_token: str, chat_id: str, text: str) -> tuple[bool, str]:
     """发送 Telegram 消息，返回 (成功, 信息)"""
     if not bot_token or not chat_id:
@@ -1334,6 +1633,18 @@ with st.sidebar:
     roll_window = st.slider("滚动相关窗口（根 K 线）", 5, 60, 20)
     normalize   = st.checkbox("标准化叠加（Z-Score）", value=True)
 
+    # ── 背离仪表板配置
+    st.markdown('<div class="sec">📺 背离实时仪表板</div>', unsafe_allow_html=True)
+    divdash_enabled   = st.checkbox("启用背离K线仪表板", value=True)
+    divdash_n_bars    = st.slider("显示K线数量", 5, 30, 15,
+                                   help="同时显示最近 N 根 1 分钟 K 线")
+    divdash_vix_thr   = st.slider("VIX 有效移动阈值（%）", 0.1, 2.0, 0.5, step=0.1,
+                                   help="VIX 单根变化超过此值才视为有效移动")
+    divdash_tsla_thr  = st.slider("TSLA 跟随阈值（%）", 0.1, 1.0, 0.3, step=0.1,
+                                   help="TSLA 未以此幅度反向移动即判定为背离")
+    divdash_cooldown  = st.slider("背离仪表板推送冷却（分钟）", 1, 30, 3,
+                                   help="背离提醒最短推送间隔")
+
     # ── VIX 急速脉冲配置
     st.markdown('<div class="sec">⚡ VIX 1分钟急升急跌</div>', unsafe_allow_html=True)
     spike_enabled  = st.checkbox("启用 VIX 急速脉冲检测", value=True)
@@ -1498,6 +1809,39 @@ if "alert_history" not in st.session_state:
     st.session_state.alert_history = []
 if "last_alert_time" not in st.session_state:
     st.session_state.last_alert_time = {}  # {type_str: datetime}
+
+# ══════════════════════════════════════════════════════════
+# 背离仪表板：实时K线检测
+# ══════════════════════════════════════════════════════════
+if "divdash_alert_time" not in st.session_state:
+    st.session_state.divdash_alert_time = None
+
+divdash_result  = {}
+divdash_fig     = None
+divdash_tg_fired = None
+
+if divdash_enabled:
+    divdash_result = detect_divergence_live(
+        df1m,
+        n_bars=divdash_n_bars,
+        div_thresh_vix=divdash_vix_thr,
+        div_thresh_tsla=divdash_tsla_thr,
+    )
+    divdash_fig = build_divdash_chart(df1m, n_bars=divdash_n_bars, div_result=divdash_result)
+
+    # Telegram 推送（独立冷却）
+    if divdash_result.get("alert") and divdash_result.get("msg"):
+        dd_now_dt  = datetime.now(ET)
+        dd_last_t  = st.session_state.divdash_alert_time
+        dd_cool_ok = (
+            dd_last_t is None or
+            (dd_now_dt - dd_last_t).total_seconds() >= divdash_cooldown * 60
+        )
+        if tg_enabled and tg_token and tg_chat_id and dd_cool_ok:
+            ok_dd, err_dd = tg_send(tg_token, tg_chat_id, divdash_result["msg"])
+            divdash_tg_fired = (ok_dd, err_dd)
+            if ok_dd:
+                st.session_state.divdash_alert_time = dd_now_dt
 
 # ══════════════════════════════════════════════════════════
 # 双引擎背离检测 & Telegram 告警
@@ -2284,6 +2628,146 @@ if r1m is not None:
                      "数值": st.column_config.TextColumn("数值", width=220),
                      "解读": st.column_config.TextColumn("解读"),
                  })
+
+# ══════════════════════════════════════════════════════════
+# 背离仪表板 UI
+# ══════════════════════════════════════════════════════════
+st.markdown('<div class="sec">📺 背离实时仪表板 — VIX × TSLA K线同框（独立信号）</div>',
+            unsafe_allow_html=True)
+
+if not divdash_enabled:
+    st.markdown("""<div style="font-family:'Space Mono',monospace;font-size:11px;
+    color:#5a5c78;padding:14px;border:1px solid #1e1f35;border-radius:10px">
+    📵 背离仪表板已关闭，在侧边栏启用「背离实时仪表板」</div>""", unsafe_allow_html=True)
+
+elif divdash_result:
+    dr     = divdash_result
+    status = dr.get("status", "flat")
+    alert  = dr.get("alert", False)
+
+    # ── 状态颜色映射
+    STATUS_CFG = {
+        "div_up":   {"color": "#ff8c00", "bg": "#ff8c0015", "border": "#ff8c0055",
+                     "emoji": "🟠", "label": "VIX ↑ · TSLA 未跌（背离）",
+                     "action": "⚠️ TSLA 补跌概率高，考虑减仓/做空"},
+        "div_down": {"color": "#3df5b0", "bg": "#3df5b015", "border": "#3df5b055",
+                     "emoji": "🔵", "label": "VIX ↓ · TSLA 未涨（背离）",
+                     "action": "✅ TSLA 补涨概率高，考虑做多/加仓"},
+        "sync":     {"color": "#7b7bff", "bg": "#7b7bff10", "border": "#7b7bff44",
+                     "emoji": "✅", "label": "VIX × TSLA 同步运动",
+                     "action": "📊 市场正常联动，无背离"},
+        "flat":     {"color": "#5a5c78", "bg": "#1e1f35",   "border": "#2a2b45",
+                     "emoji": "—",  "label": "VIX 波动不足，无有效信号",
+                     "action": "📊 等待有效移动"},
+    }
+    cfg = STATUS_CFG.get(status, STATUS_CFG["flat"])
+    ac  = cfg["color"]
+
+    # ── 顶部状态栏
+    dd_stat_col, dd_num_col = st.columns([3, 2])
+
+    with dd_stat_col:
+        # 背离状态卡
+        glow = f"box-shadow:0 0 20px {ac}44;" if alert else ""
+        tg_dd_icon = "📲 已推送" if (divdash_tg_fired and divdash_tg_fired[0]) else (
+                     f"❌ {divdash_tg_fired[1]}" if divdash_tg_fired else
+                     ("📡 监控中" if tg_enabled else "📵 未启用"))
+        last_dd_t = st.session_state.divdash_alert_time
+        cool_remain = ""
+        if last_dd_t:
+            elapsed = int((datetime.now(ET) - last_dd_t).total_seconds() / 60)
+            if elapsed < divdash_cooldown:
+                cool_remain = f"（冷却 {elapsed}/{divdash_cooldown}分）"
+
+        st.markdown(f"""
+        <div class="divdash-alert {'up' if status=='div_up' else ('down' if status=='div_down' else ('sync' if status=='sync' else 'none'))}"
+             style="{glow}">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+            <span style="font-size:24px">{cfg['emoji']}</span>
+            <div>
+              <div style="font-family:'Space Mono',monospace;font-weight:700;
+                          font-size:13px;color:{ac}">{cfg['label']}</div>
+              <div style="font-size:10px;color:#5a5c78;font-family:'Space Mono',monospace;
+                          margin-top:2px">最近 {divdash_n_bars} 根 · 阈值 VIX±{divdash_vix_thr:.1f}% TSLA±{divdash_tsla_thr:.1f}%</div>
+            </div>
+          </div>
+          <div style="background:rgba(0,0,0,.25);border-radius:7px;padding:7px 12px;
+                      font-size:12px;font-weight:700;color:{ac};margin-bottom:8px">
+            {cfg['action']}
+          </div>
+          <div style="font-family:'Space Mono',monospace;font-size:10px;color:#5a5c78">
+            {tg_dd_icon} {cool_remain} · {dr.get('now_ts','—')}
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+    with dd_num_col:
+        # 逐根背离统计
+        div_c   = dr.get("div_count", 0)
+        valid_c = dr.get("valid_count", 0)
+        div_pct = dr.get("div_pct", 0)
+        vix_tot = dr.get("vix_total", 0)
+        tsla_tot= dr.get("tsla_total", 0)
+        lv      = dr.get("last_vix")
+        lt      = dr.get("last_tsla")
+
+        bar_fill = int(div_pct * 100)
+        bar_col  = "#ff8c00" if status == "div_up" else ("#3df5b0" if status == "div_down" else "#7b7bff")
+
+        st.markdown(f"""
+        <div style="font-family:'Space Mono',monospace;font-size:11px;
+                    background:#0e0f1a;border:1px solid #1e1f35;border-radius:10px;
+                    padding:14px 16px;line-height:2.2">
+          <b style="color:#dde1f5">窗口统计</b><br>
+          VIX  当前：<b style="color:#ff3d6b">{lv:.2f}</b>
+          &nbsp;({vix_tot:+.2f}%)<br>
+          TSLA 当前：<b style="color:#7b7bff">${lt:.2f}</b>
+          &nbsp;({tsla_tot:+.2f}%)<br>
+          背离根数：<b style="color:{bar_col}">{div_c}</b> / {valid_c} 有效移动<br>
+          <div class="divdash-bar" style="margin:4px 0">
+            <span class="divdash-label">背离率</span>
+            <div class="divdash-track">
+              <div class="divdash-fill" style="width:{bar_fill}%;
+                   background:linear-gradient(90deg,{bar_col}88,{bar_col})"></div>
+            </div>
+            <span style="color:{bar_col};font-size:10px;width:32px;text-align:right">{bar_fill}%</span>
+          </div>
+        </div>""", unsafe_allow_html=True)
+
+    # ── 颜色图例
+    st.markdown("""
+    <div style="display:flex;gap:16px;font-family:'Space Mono',monospace;font-size:10px;
+                color:#5a5c78;margin:6px 0 8px;flex-wrap:wrap">
+      <span>🟠 <span style="color:#ff8c00">背离↑</span>（VIX升TSLA未跌）</span>
+      <span>🔵 <span style="color:#3df5b0">背离↓</span>（VIX降TSLA未涨）</span>
+      <span>🟣 <span style="color:#7b7bff">同步</span></span>
+      <span>⬜ <span style="color:#5a5c78">VIX无效移动</span></span>
+    </div>""", unsafe_allow_html=True)
+
+    # ── 双图表
+    if divdash_fig is not None:
+        st.plotly_chart(divdash_fig, use_container_width=True)
+
+    # ── 逐根明细表
+    bars = dr.get("bars", [])
+    if bars:
+        with st.expander(f"📋 逐根背离明细（最近 {len(bars)} 根）", expanded=False):
+            rows_dd = []
+            STATUS_LABEL = {
+                "div_up":   "🟠 背离↑", "div_down": "🔵 背离↓",
+                "sync":     "✅ 同步",  "flat":     "— 无效",
+            }
+            for b in reversed(bars):
+                t_str = b["time"].tz_convert(ET).strftime("%H:%M") if hasattr(b["time"], "tz_convert") else str(b["time"])
+                rows_dd.append({
+                    "时间(ET)":    t_str,
+                    "VIX":        f"{b['vix']:.2f}",
+                    "VIX变化":    f"{b['vix_chg']:+.2f}%",
+                    "TSLA":       f"${b['tsla']:.2f}",
+                    "TSLA变化":   f"{b['tsla_chg']:+.2f}%",
+                    "状态":       STATUS_LABEL.get(b["status"], "—"),
+                })
+            st.dataframe(pd.DataFrame(rows_dd), use_container_width=True,
+                         hide_index=True)
 
 # ══════════════════════════════════════════════════════════
 # VIX 急升急跌面板 UI
